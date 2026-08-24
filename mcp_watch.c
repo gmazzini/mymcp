@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 1.02
+// Gianluca Mazzini @2026- Version 1.03
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +15,7 @@
 #define MCP_URL "https://www.mazzini.org/mcp"
 #define MCP_PROTOCOL "2026-07-28"
 #define MCP_CLIENT_NAME "mcp-watch"
-#define MCP_CLIENT_VERSION "1.02"
+#define MCP_CLIENT_VERSION "1.03"
 #define CHROME_HOST "http://127.0.0.1:9222"
 #define CHECK_TEXT "check"
 #define WATCH_INTERVAL 60
@@ -317,7 +317,7 @@ static cJSON *query_jobs(const char *chat) {
 }
 
 static int print_running_jobs(cJSON *jobs) {
-  cJSON *item,*job_id,*state,*started_at,*elapsed;
+  cJSON *item,*job_id,*state,*started_at,*elapsed,*command;
   long total;
   int i,n,count,days,hours,minutes,seconds;
 
@@ -329,6 +329,7 @@ static int print_running_jobs(cJSON *jobs) {
     state=cJSON_GetObjectItemCaseSensitive(item,"state");
     started_at=cJSON_GetObjectItemCaseSensitive(item,"started_at");
     elapsed=cJSON_GetObjectItemCaseSensitive(item,"elapsed_seconds");
+    command=cJSON_GetObjectItemCaseSensitive(item,"command");
     if(!cJSON_IsString(job_id) || !cJSON_IsString(state)) continue;
     if(strcmp(state->valuestring,"running")!=0) continue;
     total=cJSON_IsNumber(elapsed) ? (long)elapsed->valuedouble : 0;
@@ -341,6 +342,7 @@ static int print_running_jobs(cJSON *jobs) {
     printf("  started=%s\n",cJSON_IsString(started_at) ? started_at->valuestring : "unknown");
     if(days>0) printf("  elapsed=%dd %02d:%02d:%02d\n",days,hours,minutes,seconds);
     else printf("  elapsed=%02d:%02d:%02d\n",hours,minutes,seconds);
+    printf("  command=%s\n",cJSON_IsString(command) ? command->valuestring : "unknown");
     count++;
   }
   return count;
@@ -725,11 +727,11 @@ static int ack_pending(const char *chat) {
   return 0;
 }
 
-static int check_once(const char *chat,const char *conversation_id,int query_only) {
+static int check_once(const char *chat,const char *conversation_id,int query_only,int show_running) {
   struct PendingJob pending[MAX_PENDING];
   cJSON *jobs;
   char line[256];
-  int count,i;
+  int count,running,i;
 
   if(!baseline_exists(chat)) {
     fprintf(stderr,"baseline missing for chat %s; run --baseline first\n",chat);
@@ -738,9 +740,10 @@ static int check_once(const char *chat,const char *conversation_id,int query_onl
   jobs=query_jobs(chat);
   if(!jobs) return 1;
   count=collect_pending(jobs,pending,MAX_PENDING);
-  if(query_only) print_running_jobs(jobs);
+  running=show_running ? print_running_jobs(jobs) : 0;
   cJSON_Delete(jobs);
-  printf("chat=%s pending=%d\n",chat,count);
+  if(show_running) printf("chat=%s running=%d pending=%d\n",chat,running,count);
+  else printf("chat=%s pending=%d\n",chat,count);
   for(i=0;i<count;i++) printf("pending %s exit=%d\n",pending[i].job_id,pending[i].exit_code);
   if(query_only || count==0) return 0;
   if(send_check(conversation_id)!=0) {
@@ -804,13 +807,13 @@ int main(int argc,char **argv) {
   }
   if(curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) return 1;
   if(mode==1) rc=do_baseline(chat);
-  else if(mode==2) rc=check_once(chat,conversation_id,1);
+  else if(mode==2) rc=check_once(chat,conversation_id,1,1);
   else if(mode==5) rc=ack_pending(chat);
-  else if(mode==4) rc=check_once(chat,conversation_id,0);
+  else if(mode==4) rc=check_once(chat,conversation_id,0,0);
   else {
     rc=0;
     for(;;) {
-      rc=check_once(chat,conversation_id,0);
+      rc=check_once(chat,conversation_id,0,1);
       if(rc==2) break;
       sleep(WATCH_INTERVAL);
     }
