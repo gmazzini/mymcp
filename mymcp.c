@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 1.05
+// Gianluca Mazzini @2026- Version 1.08
 
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
@@ -23,7 +23,7 @@
 #include <unistd.h>
 
 #define SERVER_NAME "mymcp"
-#define SERVER_VERSION "1.05"
+#define SERVER_VERSION "1.08"
 #define PROTOCOL_VERSION "2026-07-28"
 #define WORK_DIR "/home/tools/mcp/work"
 #ifndef JOBS_DIR
@@ -48,6 +48,15 @@
 #define LOG_VALUE_MAX 2048
 #define LOG_DETAIL_MAX 4608
 #define LOG_LINE_MAX 5632
+#define AGENT_ID_MAX 64
+#define AGENT_TOKEN_MAX 255
+#define AGENT_NAME_MAX 64
+#define AGENT_REQUEST_ID_LEN 20
+#define AGENT_WAIT_SECONDS 25
+#define AGENT_CALL_TIMEOUT 30
+#define AGENT_CALL_TIMEOUT_MAX 300
+#define AGENT_CONFIG_DEFAULT "/home/tools/mcp/agent.conf"
+#define AGENT_DIR_DEFAULT "/home/tools/mcp/agent"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -55,6 +64,7 @@
 
 typedef struct {
   char method[16],path[256],mcp_version[64],mcp_method[128],mcp_name[256];
+  char agent_id[AGENT_ID_MAX+1],agent_action[16],agent_token[AGENT_TOKEN_MAX+1];
   char *body;
   size_t body_len;
 } HttpRequest;
@@ -523,6 +533,445 @@ static int send_json(int fd,int status,cJSON *root) {
   return rc;
 }
 
+static int send_agent_json(int fd,int status,cJSON *root) {
+  char header[512],*json;
+  const char *status_text;
+  size_t len;
+  int n,rc;
+
+  if(status==200) status_text="OK";
+  else if(status==400) status_text="Bad Request";
+  else if(status==403) status_text="Forbidden";
+  else if(status==404) status_text="Not Found";
+  else if(status==409) status_text="Conflict";
+  else if(status==503) status_text="Service Unavailable";
+  else status_text="Internal Server Error";
+  json=cJSON_PrintUnformatted(root);
+  if(json==NULL) return -1;
+  len=strlen(json);
+  n=snprintf(header,sizeof(header),
+    "HTTP/1.1 %d %s\r\n"
+    "Content-Type: application/json\r\n"
+    "Content-Length: %lu\r\n"
+    "Connection: close\r\n\r\n",
+    status,status_text,(unsigned long)len);
+  if(n<0 || (size_t)n>=sizeof(header)) {
+    free(json);
+    return -1;
+  }
+  rc=send_all(fd,header,(size_t)n);
+  if(rc==0) rc=send_all(fd,json,len);
+  free(json);
+  return rc;
+}
+
+static int valid_agent_name(const char *name) {
+  size_t i,len;
+  unsigned char c;
+
+  if(name==NULL) return 0;
+  len=strlen(name);
+  if(len<1 || len>AGENT_NAME_MAX) return 0;
+  for(i=0;i<len;i++) {
+    c=(unsigned char)name[i];
+    if(!isalnum(c) && c!='_' && c!='-' && c!='.') return 0;
+  }
+  return 1;
+}
+
+static int valid_agent_id(const char *agent_id) {
+  if(agent_id==NULL || strlen(agent_id)>AGENT_ID_MAX) return 0;
+  return valid_agent_name(agent_id);
+}
+
+static int secure_token_equal(const char *a,const char *b) {
+  size_t i,la,lb;
+  unsigned char diff;
+
+  if(a==NULL || b==NULL) return 0;
+  la=strlen(a);
+  lb=strlen(b);
+  if(la!=lb) return 0;
+  diff=0;
+  for(i=0;i<la;i++) diff|=(unsigned char)a[i]^(unsigned char)b[i];
+  return diff==0;
+}
+
+static const char *agent_config_path(void) {
+  const char *p;
+
+  p=getenv("MYMCP_AGENT_CONFIG");
+  return p!=NULL && p[0]!=0?p:AGENT_CONFIG_DEFAULT;
+}
+
+static const char *agent_root_dir(void) {
+  const char *p;
+
+  p=getenv("MYMCP_AGENT_DIR");
+  return p!=NULL && p[0]!=0?p:AGENT_DIR_DEFAULT;
+}
+
+static int agent_module_allowed(const char *modules,const char *module) {
+  const char *p,*end;
+  size_t len,module_len;
+
+  if(modules==NULL || module==NULL) return 0;
+  module_len=strlen(module);
+  p=modules;
+  for(;*p!=0;) {
+    end=strchr(p,',');
+    len=end!=NULL?(size_t)(end-p):strlen(p);
+    if(len==module_len && strncmp(p,module,len)==0) return 1;
+    if(end==NULL) break;
+    p=end+1;
+  }
+  return 0;
+}
+
+static int agent_authenticate(const char *agent_id,const char *token,char *modules,size_t modules_size) {
+  FILE *f;
+  char line[2048],id[AGENT_ID_MAX+1],file_token[AGENT_TOKEN_MAX+1],file_modules[1024],*p;
+  int fields;
+
+  if(!valid_agent_id(agent_id) || token==NULL || token[0]==0 || strlen(token)>AGENT_TOKEN_MAX || modules_size==0) return -1;
+  f=fopen(agent_config_path(),"r");
+  if(f==NULL) return -1;
+  for(;fgets(line,sizeof(line),f)!=NULL;) {
+    p=line;
+    for(;*p==' ' || *p=='\t';p++);
+    if(*p==0 || *p=='\n' || *p=='#') continue;
+    fields=sscanf(p,"%64s %255s %1023s",id,file_token,file_modules);
+    if(fields!=3 || strcmp(id,agent_id)!=0) continue;
+    if(!secure_token_equal(file_token,token)) continue;
+    if(strlen(file_modules)+1>modules_size) {
+      fclose(f);
+      return -1;
+    }
+    strcpy(modules,file_modules);
+    fclose(f);
+    return 0;
+  }
+  fclose(f);
+  return -1;
+}
+
+static int agent_module_configured(const char *module,const char *target_agent) {
+  FILE *f;
+  char line[2048],id[AGENT_ID_MAX+1],token[AGENT_TOKEN_MAX+1],modules[1024],*p;
+  int fields,found;
+
+  if(!valid_agent_name(module)) return 0;
+  if(target_agent!=NULL && target_agent[0]!=0 && !valid_agent_id(target_agent)) return 0;
+  f=fopen(agent_config_path(),"r");
+  if(f==NULL) return 0;
+  found=0;
+  for(;fgets(line,sizeof(line),f)!=NULL;) {
+    p=line;
+    for(;*p==' ' || *p=='\t';p++);
+    if(*p==0 || *p=='\n' || *p=='#') continue;
+    fields=sscanf(p,"%64s %255s %1023s",id,token,modules);
+    if(fields!=3) continue;
+    if(target_agent!=NULL && target_agent[0]!=0 && strcmp(id,target_agent)!=0) continue;
+    if(agent_module_allowed(modules,module)) {
+      found=1;
+      break;
+    }
+  }
+  fclose(f);
+  return found;
+}
+
+static int ensure_agent_dir_one(const char *path) {
+  struct stat st;
+
+  if(lstat(path,&st)==0) return S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)?0:-1;
+  if(errno!=ENOENT) return -1;
+  if(mkdir(path,0700)!=0) return -1;
+  return 0;
+}
+
+static int ensure_agent_dirs(void) {
+  const char *root;
+  char path[PATH_MAX];
+  int n;
+
+  root=agent_root_dir();
+  if(root[0]!='/') return -1;
+  if(ensure_agent_dir_one(root)!=0) return -1;
+  n=snprintf(path,sizeof(path),"%s/queue",root);
+  if(n<0 || (size_t)n>=sizeof(path) || ensure_agent_dir_one(path)!=0) return -1;
+  n=snprintf(path,sizeof(path),"%s/running",root);
+  if(n<0 || (size_t)n>=sizeof(path) || ensure_agent_dir_one(path)!=0) return -1;
+  n=snprintf(path,sizeof(path),"%s/done",root);
+  if(n<0 || (size_t)n>=sizeof(path) || ensure_agent_dir_one(path)!=0) return -1;
+  return 0;
+}
+
+static int valid_agent_request_id(const char *request_id) {
+  int i;
+
+  if(request_id==NULL || strlen(request_id)!=AGENT_REQUEST_ID_LEN) return 0;
+  if(strncmp(request_id,"req_",4)!=0) return 0;
+  for(i=4;i<AGENT_REQUEST_ID_LEN;i++) if(!isxdigit((unsigned char)request_id[i])) return 0;
+  return 1;
+}
+
+static int make_agent_request_id(char *out,size_t out_size) {
+  unsigned char raw[8];
+  int fd,n,i;
+
+  if(out_size<AGENT_REQUEST_ID_LEN+1) return -1;
+  fd=open("/dev/urandom",O_RDONLY);
+  if(fd<0) return -1;
+  n=(int)read(fd,raw,sizeof(raw));
+  close(fd);
+  if(n!=(int)sizeof(raw)) return -1;
+  strcpy(out,"req_");
+  for(i=0;i<8;i++) sprintf(out+4+i*2,"%02x",raw[i]);
+  out[AGENT_REQUEST_ID_LEN]=0;
+  return 0;
+}
+
+static int agent_file_path(const char *state,const char *request_id,char *out,size_t out_size) {
+  int n;
+
+  if(!valid_agent_request_id(request_id)) return -1;
+  if(strcmp(state,"queue")!=0 && strcmp(state,"running")!=0 && strcmp(state,"done")!=0) return -1;
+  n=snprintf(out,out_size,"%s/%s/%s.json",agent_root_dir(),state,request_id);
+  if(n<0 || (size_t)n>=out_size) return -1;
+  return 0;
+}
+
+static int write_json_atomic(const char *path,cJSON *root) {
+  char tmp[PATH_MAX],*text;
+  int n,rc;
+
+  n=snprintf(tmp,sizeof(tmp),"%s.new.%ld",path,(long)getpid());
+  if(n<0 || (size_t)n>=sizeof(tmp)) return -1;
+  text=cJSON_PrintUnformatted(root);
+  if(text==NULL) return -1;
+  rc=write_text_file(tmp,text);
+  free(text);
+  if(rc!=0) {
+    unlink(tmp);
+    return -1;
+  }
+  if(rename(tmp,path)!=0) {
+    unlink(tmp);
+    return -1;
+  }
+  return 0;
+}
+
+static cJSON *read_json_path(const char *path) {
+  char *text;
+  cJSON *root;
+
+  text=read_file_alloc(path,MAX_BODY,NULL);
+  if(text==NULL) return NULL;
+  root=cJSON_Parse(text);
+  free(text);
+  return root;
+}
+
+static int agent_enqueue(const char *chat,const char *target_agent,const char *module,const char *action,
+  cJSON *payload,char *request_id,size_t request_id_size) {
+  cJSON *root,*copy;
+  char path[PATH_MAX];
+  int attempts;
+
+  if(ensure_agent_dirs()!=0) return -1;
+  for(attempts=0;attempts<20;attempts++) {
+    if(make_agent_request_id(request_id,request_id_size)!=0) return -1;
+    if(agent_file_path("queue",request_id,path,sizeof(path))!=0) return -1;
+    if(access(path,F_OK)!=0) break;
+  }
+  if(attempts==20) return -1;
+  root=cJSON_CreateObject();
+  if(root==NULL) return -1;
+  cJSON_AddNumberToObject(root,"version",1);
+  cJSON_AddStringToObject(root,"request_id",request_id);
+  cJSON_AddStringToObject(root,"chat",chat);
+  if(target_agent!=NULL && target_agent[0]!=0) cJSON_AddStringToObject(root,"target_agent",target_agent);
+  cJSON_AddStringToObject(root,"module",module);
+  cJSON_AddStringToObject(root,"action",action);
+  copy=payload!=NULL?cJSON_Duplicate(payload,1):cJSON_CreateObject();
+  if(copy==NULL) {
+    cJSON_Delete(root);
+    return -1;
+  }
+  cJSON_AddItemToObject(root,"payload",copy);
+  cJSON_AddNumberToObject(root,"created_epoch",now_seconds());
+  if(write_json_atomic(path,root)!=0) {
+    cJSON_Delete(root);
+    return -1;
+  }
+  cJSON_Delete(root);
+  return 0;
+}
+
+static int request_filename_id(const char *name,char *request_id,size_t out_size) {
+  size_t len,id_len;
+
+  if(name==NULL) return -1;
+  len=strlen(name);
+  if(len<6 || strcmp(name+len-5,".json")!=0) return -1;
+  id_len=len-5;
+  if(id_len+1>out_size) return -1;
+  memcpy(request_id,name,id_len);
+  request_id[id_len]=0;
+  return valid_agent_request_id(request_id)?0:-1;
+}
+
+static cJSON *agent_claim_next(const char *agent_id,const char *modules) {
+  DIR *d;
+  struct dirent *de;
+  cJSON *root,*module_item,*target_item,*created_item;
+  char dir_path[PATH_MAX],path[PATH_MAX],best_id[AGENT_REQUEST_ID_LEN+1],request_id[AGENT_REQUEST_ID_LEN+1];
+  char queue_path[PATH_MAX],running_path[PATH_MAX];
+  double created,best_created;
+  int n,have_best;
+
+  n=snprintf(dir_path,sizeof(dir_path),"%s/queue",agent_root_dir());
+  if(n<0 || (size_t)n>=sizeof(dir_path)) return NULL;
+  d=opendir(dir_path);
+  if(d==NULL) return NULL;
+  have_best=0;
+  best_created=0.0;
+  best_id[0]=0;
+  for(; (de=readdir(d))!=NULL;) {
+    if(request_filename_id(de->d_name,request_id,sizeof(request_id))!=0) continue;
+    if(agent_file_path("queue",request_id,path,sizeof(path))!=0) continue;
+    root=read_json_path(path);
+    if(!cJSON_IsObject(root)) {
+      cJSON_Delete(root);
+      continue;
+    }
+    module_item=cJSON_GetObjectItemCaseSensitive(root,"module");
+    target_item=cJSON_GetObjectItemCaseSensitive(root,"target_agent");
+    created_item=cJSON_GetObjectItemCaseSensitive(root,"created_epoch");
+    if(!cJSON_IsString(module_item) || !agent_module_allowed(modules,module_item->valuestring) || !cJSON_IsNumber(created_item)) {
+      cJSON_Delete(root);
+      continue;
+    }
+    if(cJSON_IsString(target_item) && strcmp(target_item->valuestring,agent_id)!=0) {
+      cJSON_Delete(root);
+      continue;
+    }
+    created=created_item->valuedouble;
+    if(!have_best || created<best_created) {
+      strcpy(best_id,request_id);
+      best_created=created;
+      have_best=1;
+    }
+    cJSON_Delete(root);
+  }
+  closedir(d);
+  if(!have_best) return NULL;
+  if(agent_file_path("queue",best_id,queue_path,sizeof(queue_path))!=0 ||
+    agent_file_path("running",best_id,running_path,sizeof(running_path))!=0) return NULL;
+  if(rename(queue_path,running_path)!=0) return NULL;
+  root=read_json_path(running_path);
+  if(!cJSON_IsObject(root)) {
+    cJSON_Delete(root);
+    rename(running_path,queue_path);
+    return NULL;
+  }
+  cJSON_AddStringToObject(root,"agent_id",agent_id);
+  cJSON_AddNumberToObject(root,"claimed_epoch",now_seconds());
+  if(write_json_atomic(running_path,root)!=0) {
+    cJSON_Delete(root);
+    rename(running_path,queue_path);
+    return NULL;
+  }
+  return root;
+}
+
+static cJSON *agent_done_read(const char *request_id) {
+  char path[PATH_MAX];
+
+  if(agent_file_path("done",request_id,path,sizeof(path))!=0) return NULL;
+  return read_json_path(path);
+}
+
+static int agent_request_state(const char *request_id) {
+  char path[PATH_MAX];
+
+  if(agent_file_path("done",request_id,path,sizeof(path))==0 && access(path,F_OK)==0) return 3;
+  if(agent_file_path("running",request_id,path,sizeof(path))==0 && access(path,F_OK)==0) return 2;
+  if(agent_file_path("queue",request_id,path,sizeof(path))==0 && access(path,F_OK)==0) return 1;
+  return 0;
+}
+
+static int agent_cancel_queued(const char *request_id) {
+  char path[PATH_MAX];
+
+  if(agent_file_path("queue",request_id,path,sizeof(path))!=0) return -1;
+  if(unlink(path)==0 || errno==ENOENT) return 0;
+  return -1;
+}
+
+static int agent_store_result(const char *agent_id,const char *request_id,const char *status,cJSON *result_item,
+  const char *error_text) {
+  cJSON *request,*done,*owner,*item,*copy;
+  char running_path[PATH_MAX],done_path[PATH_MAX];
+
+  if(agent_file_path("done",request_id,done_path,sizeof(done_path))!=0 ||
+    agent_file_path("running",request_id,running_path,sizeof(running_path))!=0) return -1;
+  done=read_json_path(done_path);
+  if(cJSON_IsObject(done)) {
+    owner=cJSON_GetObjectItemCaseSensitive(done,"agent_id");
+    if(cJSON_IsString(owner) && strcmp(owner->valuestring,agent_id)==0) {
+      cJSON_Delete(done);
+      return 1;
+    }
+  }
+  cJSON_Delete(done);
+  request=read_json_path(running_path);
+  if(!cJSON_IsObject(request)) {
+    cJSON_Delete(request);
+    return -2;
+  }
+  owner=cJSON_GetObjectItemCaseSensitive(request,"agent_id");
+  if(!cJSON_IsString(owner) || strcmp(owner->valuestring,agent_id)!=0) {
+    cJSON_Delete(request);
+    return -2;
+  }
+  done=cJSON_CreateObject();
+  if(done==NULL) {
+    cJSON_Delete(request);
+    return -1;
+  }
+  cJSON_AddStringToObject(done,"request_id",request_id);
+  cJSON_AddStringToObject(done,"agent_id",agent_id);
+  item=cJSON_GetObjectItemCaseSensitive(request,"chat");
+  if(item!=NULL) cJSON_AddItemToObject(done,"chat",cJSON_Duplicate(item,1));
+  item=cJSON_GetObjectItemCaseSensitive(request,"module");
+  if(item!=NULL) cJSON_AddItemToObject(done,"module",cJSON_Duplicate(item,1));
+  item=cJSON_GetObjectItemCaseSensitive(request,"action");
+  if(item!=NULL) cJSON_AddItemToObject(done,"action",cJSON_Duplicate(item,1));
+  cJSON_AddStringToObject(done,"status",status);
+  if(strcmp(status,"ok")==0) {
+    copy=result_item!=NULL?cJSON_Duplicate(result_item,1):cJSON_CreateNull();
+    if(copy==NULL) {
+      cJSON_Delete(done);
+      cJSON_Delete(request);
+      return -1;
+    }
+    cJSON_AddItemToObject(done,"result",copy);
+  } else cJSON_AddStringToObject(done,"error",error_text!=NULL?error_text:"agent error");
+  cJSON_AddNumberToObject(done,"completed_epoch",now_seconds());
+  if(write_json_atomic(done_path,done)!=0) {
+    cJSON_Delete(done);
+    cJSON_Delete(request);
+    return -1;
+  }
+  unlink(running_path);
+  cJSON_Delete(done);
+  cJSON_Delete(request);
+  return 0;
+}
+
 static void free_http_request(HttpRequest *req) {
   if(req->body!=NULL) free(req->body);
   req->body=NULL;
@@ -573,6 +1022,9 @@ static int read_http_request(int fd,HttpRequest *req) {
     else if(strcasecmp(line,"MCP-Protocol-Version")==0) snprintf(req->mcp_version,sizeof(req->mcp_version),"%s",value);
     else if(strcasecmp(line,"Mcp-Method")==0) snprintf(req->mcp_method,sizeof(req->mcp_method),"%s",value);
     else if(strcasecmp(line,"Mcp-Name")==0) snprintf(req->mcp_name,sizeof(req->mcp_name),"%s",value);
+    else if(strcasecmp(line,"X-MCP-Agent")==0) snprintf(req->agent_id,sizeof(req->agent_id),"%s",value);
+    else if(strcasecmp(line,"X-MCP-Agent-Action")==0) snprintf(req->agent_action,sizeof(req->agent_action),"%s",value);
+    else if(strcasecmp(line,"X-MCP-Agent-Token")==0) snprintf(req->agent_token,sizeof(req->agent_token),"%s",value);
   }
   if(content_len>MAX_BODY) return -2;
   req->body=(char *)malloc(content_len+1);
@@ -598,6 +1050,118 @@ static int read_http_request(int fd,HttpRequest *req) {
   }
   req->body[content_len]=0;
   return 0;
+}
+
+static cJSON *agent_message(const char *status,const char *message) {
+  cJSON *root;
+
+  root=cJSON_CreateObject();
+  if(root==NULL) return NULL;
+  cJSON_AddStringToObject(root,"status",status);
+  if(message!=NULL) cJSON_AddStringToObject(root,"message",message);
+  return root;
+}
+
+static int handle_agent_connection(int fd,HttpRequest *http) {
+  char modules[1024],request_id_copy[AGENT_REQUEST_ID_LEN+1];
+  const char *request_id,*status_text,*error_text;
+  cJSON *root,*response,*item,*result_item;
+  double started;
+  int rc;
+
+  if(http->agent_id[0]==0 || http->agent_action[0]==0 || http->agent_token[0]==0) {
+    response=agent_message("error","incomplete agent headers");
+    send_agent_json(fd,403,response);
+    cJSON_Delete(response);
+    return 403;
+  }
+  if(agent_authenticate(http->agent_id,http->agent_token,modules,sizeof(modules))!=0) {
+    response=agent_message("error","agent authentication failed");
+    send_agent_json(fd,403,response);
+    cJSON_Delete(response);
+    return 403;
+  }
+  if(ensure_agent_dirs()!=0) {
+    response=agent_message("error","agent runtime unavailable");
+    send_agent_json(fd,503,response);
+    cJSON_Delete(response);
+    return 503;
+  }
+  if(strcmp(http->agent_action,"wait")==0) {
+    started=now_seconds();
+    for(;;) {
+      root=agent_claim_next(http->agent_id,modules);
+      if(root!=NULL) {
+        cJSON_AddStringToObject(root,"status","request");
+        send_agent_json(fd,200,root);
+        cJSON_Delete(root);
+        return 200;
+      }
+      if(now_seconds()-started>=(double)AGENT_WAIT_SECONDS) break;
+      usleep(100000);
+    }
+    response=agent_message("idle",NULL);
+    send_agent_json(fd,200,response);
+    cJSON_Delete(response);
+    return 200;
+  }
+  if(strcmp(http->agent_action,"result")!=0) {
+    response=agent_message("error","unknown agent action");
+    send_agent_json(fd,400,response);
+    cJSON_Delete(response);
+    return 400;
+  }
+  root=cJSON_ParseWithLength(http->body,http->body_len);
+  if(!cJSON_IsObject(root)) {
+    cJSON_Delete(root);
+    response=agent_message("error","invalid result body");
+    send_agent_json(fd,400,response);
+    cJSON_Delete(response);
+    return 400;
+  }
+  item=cJSON_GetObjectItemCaseSensitive(root,"request_id");
+  request_id=cJSON_IsString(item)?item->valuestring:NULL;
+  item=cJSON_GetObjectItemCaseSensitive(root,"status");
+  status_text=cJSON_IsString(item)?item->valuestring:NULL;
+  if(!valid_agent_request_id(request_id) || status_text==NULL ||
+    (strcmp(status_text,"ok")!=0 && strcmp(status_text,"error")!=0)) {
+    cJSON_Delete(root);
+    response=agent_message("error","invalid request_id or status");
+    send_agent_json(fd,400,response);
+    cJSON_Delete(response);
+    return 400;
+  }
+  result_item=cJSON_GetObjectItemCaseSensitive(root,"result");
+  item=cJSON_GetObjectItemCaseSensitive(root,"error");
+  error_text=cJSON_IsString(item)?item->valuestring:NULL;
+  if(strcmp(status_text,"error")==0 && error_text==NULL) {
+    cJSON_Delete(root);
+    response=agent_message("error","error status requires error text");
+    send_agent_json(fd,400,response);
+    cJSON_Delete(response);
+    return 400;
+  }
+  strcpy(request_id_copy,request_id);
+  rc=agent_store_result(http->agent_id,request_id_copy,status_text,result_item,error_text);
+  cJSON_Delete(root);
+  if(rc==-2) {
+    response=agent_message("error","request not owned by this agent");
+    send_agent_json(fd,409,response);
+    cJSON_Delete(response);
+    return 409;
+  }
+  if(rc<0) {
+    response=agent_message("error","cannot store agent result");
+    send_agent_json(fd,503,response);
+    cJSON_Delete(response);
+    return 503;
+  }
+  response=agent_message("accepted",NULL);
+  cJSON_AddStringToObject(response,"request_id",request_id_copy);
+  if(rc==1) cJSON_AddBoolToObject(response,"duplicate",1);
+  send_agent_json(fd,200,response);
+  cJSON_Delete(response);
+  return 200;
 }
 
 static cJSON *make_text_content(const char *text) {
@@ -803,6 +1367,19 @@ static cJSON *build_tools(void) {
   cJSON_AddNumberToObject(s,"minimum",1);
   cJSON_AddNumberToObject(s,"maximum",1000);
   add_property(tool,"limit",s);
+  cJSON_AddItemToArray(tools,tool);
+
+  tool=new_tool("agent_call","Send a typed request to an authorized remote agent and wait for its result.");
+  add_property(tool,"agent",schema_string());
+  add_property(tool,"module",schema_string());
+  add_property(tool,"action",schema_string());
+  add_property(tool,"payload",cJSON_CreateObject());
+  s=schema_integer(AGENT_CALL_TIMEOUT,1);
+  cJSON_AddNumberToObject(s,"minimum",1);
+  cJSON_AddNumberToObject(s,"maximum",AGENT_CALL_TIMEOUT_MAX);
+  add_property(tool,"timeout",s);
+  require_field(tool,"module");
+  require_field(tool,"action");
   cJSON_AddItemToArray(tools,tool);
 
   return tools;
@@ -1873,6 +2450,150 @@ static cJSON *tool_jobs(cJSON *args) {
   return tool_result_json(array,0);
 }
 
+static int valid_edistribuzione_pod(const char *pod) {
+  const unsigned char *p;
+
+  if(pod==NULL || pod[0]==0 || strlen(pod)>64) return 0;
+  for(p=(const unsigned char *)pod;*p!=0;p++) {
+    if(!isalnum(*p) && *p!='_' && *p!='-') return 0;
+  }
+  return 1;
+}
+
+static int save_edistribuzione_csv(cJSON *done) {
+  cJSON *result,*code,*pod,*year,*month,*days,*day,*date_key,*samples,*sample,*key,*value;
+  char rel[PATH_MAX],path[PATH_MAX],tmp[PATH_MAX],date[11],time_value[6],line[256];
+  const char *raw_date;
+  FILE *f;
+  int n,quarter,hour,minute,rc;
+
+  result=cJSON_GetObjectItemCaseSensitive(done,"result");
+  if(!cJSON_IsObject(result)) return 0;
+  code=cJSON_GetObjectItemCaseSensitive(result,"code");
+  if(!cJSON_IsString(code) || strcmp(code->valuestring,"OK")!=0) return 0;
+  pod=cJSON_GetObjectItemCaseSensitive(result,"pod");
+  year=cJSON_GetObjectItemCaseSensitive(result,"year");
+  month=cJSON_GetObjectItemCaseSensitive(result,"month");
+  days=cJSON_GetObjectItemCaseSensitive(result,"days");
+  if(!cJSON_IsString(pod) || !valid_edistribuzione_pod(pod->valuestring) || !cJSON_IsNumber(year) ||
+    !cJSON_IsNumber(month) || !cJSON_IsArray(days)) return -1;
+  n=snprintf(rel,sizeof(rel),"mymcp/tmpdata/%s_%04d_%02d.csv",pod->valuestring,year->valueint,month->valueint);
+  if(n<0 || (size_t)n>=sizeof(rel) || ensure_write_path(rel,path,sizeof(path))!=0) return -1;
+  n=snprintf(tmp,sizeof(tmp),"%s.new",path);
+  if(n<0 || (size_t)n>=sizeof(tmp)) return -1;
+  f=fopen(tmp,"w");
+  if(f==NULL) return -1;
+  rc=0;
+  if(fputs("date,time,value\n",f)==EOF) rc=-1;
+  cJSON_ArrayForEach(day,days) {
+    if(rc!=0) break;
+    date_key=cJSON_GetObjectItemCaseSensitive(day,"date_key");
+    samples=cJSON_GetObjectItemCaseSensitive(day,"samples");
+    if(!cJSON_IsString(date_key) || !cJSON_IsArray(samples)) { rc=-1; break; }
+    raw_date=date_key->valuestring;
+    if(strlen(raw_date)==9 && raw_date[6]=='-')
+      n=snprintf(date,sizeof(date),"%.4s-%.2s-%.2s",raw_date,raw_date+4,raw_date+7);
+    else if(strlen(raw_date)==8)
+      n=snprintf(date,sizeof(date),"%.4s-%.2s-%.2s",raw_date,raw_date+4,raw_date+6);
+    else { rc=-1; break; }
+    if(n!=10) { rc=-1; break; }
+    cJSON_ArrayForEach(sample,samples) {
+      key=cJSON_GetObjectItemCaseSensitive(sample,"key");
+      value=cJSON_GetObjectItemCaseSensitive(sample,"value");
+      if(!cJSON_IsString(key) || !cJSON_IsNumber(value)) { rc=-1; break; }
+      quarter=atoi(key->valuestring);
+      if(quarter>=1 && quarter<=96) minute=(quarter-1)*15;
+      else if(quarter>=97 && quarter<=100) minute=120+(quarter-97)*15;
+      else { rc=-1; break; }
+      hour=minute/60;
+      minute%=60;
+      n=snprintf(time_value,sizeof(time_value),"%02d:%02d",hour,minute);
+      if(n!=5) { rc=-1; break; }
+      n=snprintf(line,sizeof(line),"%s,%s,%.15g\n",date,time_value,value->valuedouble);
+      if(n<0 || (size_t)n>=sizeof(line) || fputs(line,f)==EOF) { rc=-1; break; }
+    }
+  }
+  if(fclose(f)!=0) rc=-1;
+  if(rc==0 && rename(tmp,path)!=0) rc=-1;
+  if(rc!=0) unlink(tmp);
+  if(rc==0) cJSON_AddStringToObject(result,"csv_file",rel);
+  return rc;
+}
+
+static void maybe_save_agent_result(const char *module,const char *action,cJSON *done) {
+  cJSON *status;
+
+  if(strcmp(module,"edistribuzione")!=0 || strcmp(action,"load_profile.month")!=0) return;
+  status=cJSON_GetObjectItemCaseSensitive(done,"status");
+  if(!cJSON_IsString(status) || strcmp(status->valuestring,"ok")!=0) return;
+  save_edistribuzione_csv(done);
+}
+
+static cJSON *tool_agent_call(cJSON *args) {
+  const char *chat,*target_agent,*module,*action;
+  cJSON *payload,*done,*status_item,*data;
+  char request_id[AGENT_REQUEST_ID_LEN+1];
+  double started;
+  int timeout,state,is_error;
+
+  chat=NULL;
+  target_agent=NULL;
+  module=NULL;
+  action=NULL;
+  timeout=AGENT_CALL_TIMEOUT;
+  if(get_string_arg(args,"chat",&chat,1)<0 || !valid_chat(chat)) return tool_result_string("invalid chat",1);
+  if(get_string_arg(args,"agent",&target_agent,0)<0 ||
+    (target_agent!=NULL && !valid_agent_id(target_agent))) return tool_result_string("invalid agent",1);
+  if(get_string_arg(args,"module",&module,1)<0 || !valid_agent_name(module)) return tool_result_string("invalid module",1);
+  if(get_string_arg(args,"action",&action,1)<0 || !valid_agent_name(action)) return tool_result_string("invalid action",1);
+  if(get_int_arg(args,"timeout",&timeout,AGENT_CALL_TIMEOUT)<0 || timeout<1 || timeout>AGENT_CALL_TIMEOUT_MAX)
+    return tool_result_string("timeout out of range",1);
+  payload=cJSON_GetObjectItemCaseSensitive(args,"payload");
+  if(!agent_module_configured(module,target_agent)) return tool_result_string("no configured agent provides this module",1);
+  if(agent_enqueue(chat,target_agent,module,action,payload,request_id,sizeof(request_id))!=0)
+    return tool_result_string("cannot queue agent request",1);
+  started=now_seconds();
+  for(;;) {
+    done=agent_done_read(request_id);
+    if(cJSON_IsObject(done)) {
+      cJSON_AddStringToObject(done,"state","done");
+      status_item=cJSON_GetObjectItemCaseSensitive(done,"status");
+      is_error=!cJSON_IsString(status_item) || strcmp(status_item->valuestring,"ok")!=0;
+      maybe_save_agent_result(module,action,done);
+      return tool_result_json(done,is_error);
+    }
+    cJSON_Delete(done);
+    if(now_seconds()-started>=(double)timeout) break;
+    usleep(50000);
+  }
+  done=agent_done_read(request_id);
+  if(cJSON_IsObject(done)) {
+    cJSON_AddStringToObject(done,"state","done");
+    status_item=cJSON_GetObjectItemCaseSensitive(done,"status");
+    is_error=!cJSON_IsString(status_item) || strcmp(status_item->valuestring,"ok")!=0;
+    maybe_save_agent_result(module,action,done);
+    return tool_result_json(done,is_error);
+  }
+  cJSON_Delete(done);
+  state=agent_request_state(request_id);
+  data=cJSON_CreateObject();
+  if(data==NULL) return tool_result_string("out of memory",1);
+  cJSON_AddStringToObject(data,"request_id",request_id);
+  cJSON_AddStringToObject(data,"status","timeout");
+  if(state==1) {
+    agent_cancel_queued(request_id);
+    cJSON_AddStringToObject(data,"state","cancelled");
+    cJSON_AddBoolToObject(data,"delivered",0);
+  } else if(state==2) {
+    cJSON_AddStringToObject(data,"state","running");
+    cJSON_AddBoolToObject(data,"delivered",1);
+  } else {
+    cJSON_AddStringToObject(data,"state","unknown");
+    cJSON_AddBoolToObject(data,"delivered",0);
+  }
+  return tool_result_json(data,1);
+}
+
 static cJSON *dispatch_tool(const char *name,cJSON *args) {
   const char *chat;
 
@@ -1891,6 +2612,7 @@ static cJSON *dispatch_tool(const char *name,cJSON *args) {
   if(strcmp(name,"tail")==0) return tool_tail(args);
   if(strcmp(name,"stop")==0) return tool_stop(args);
   if(strcmp(name,"jobs")==0) return tool_jobs(args);
+  if(strcmp(name,"agent_call")==0) return tool_agent_call(args);
   return NULL;
 }
 
@@ -1968,6 +2690,15 @@ static void handle_connection(int fd) {
     send_json(fd,404,response); cJSON_Delete(response); free_http_request(&http);
     elapsed_ms=(now_seconds()-started)*1000.0;
     log_request(chat,client,method_name,tool_name,404,elapsed_ms);
+    return;
+  }
+  if(http.agent_id[0]!=0 || http.agent_action[0]!=0 || http.agent_token[0]!=0) {
+    snprintf(client,sizeof(client),"agent/%s",http.agent_id[0]!=0?http.agent_id:"unknown");
+    snprintf(method_name,sizeof(method_name),"agent/%s",http.agent_action[0]!=0?http.agent_action:"unknown");
+    status=handle_agent_connection(fd,&http);
+    free_http_request(&http);
+    elapsed_ms=(now_seconds()-started)*1000.0;
+    log_request(chat,client,method_name,tool_name,status,elapsed_ms);
     return;
   }
   root=cJSON_ParseWithLength(http.body,http.body_len);

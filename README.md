@@ -2,7 +2,7 @@
 
 ## Project status
 
-Current version: **1.04**
+Current version: **1.07**
 
 `mymcp` is a small MCP server written in C and designed to replace the previous Python MCP server that used the official Python MCP SDK.
 
@@ -31,6 +31,22 @@ The MCP work root exposed to tools is:
 ```
 
 Do not scatter project files directly in `/home/tools/mcp/work`. Create a subdirectory for each project.
+
+### Temporary bulk data convention
+
+A project that needs large amounts of temporary, generated or easily reproducible data must use:
+
+```text
+/home/tools/mcp/work/<project>/tmpdata/
+```
+
+`tmpdata/` is intentionally non-persistent and is excluded from normal backups. It may be deleted at any time without affecting the ability to preserve or resume the project.
+
+Use `tmpdata/` only for items such as generated datasets, caches, temporary copies, intermediate computation output and other bulky data that can be recreated.
+
+Never store in `tmpdata/` source code, configuration files, documentation, final results, irreplaceable measurements, required checkpoints or any other data needed to reproduce or resume the work.
+
+Chats working on MCP projects should follow this convention whenever they create substantial temporary data.
 
 The old Python MCP runtime was removed after the C implementation became stable. Python scripts that belong to individual projects under `work/` are unrelated and may still exist.
 
@@ -64,22 +80,24 @@ The source follows the user's C style rules.
 - Source header format is:
 
 ```c
-// Gianluca Mazzini @2026- Version 1.04
+// Gianluca Mazzini @2026- Version 1.07
 ```
 
-The initial development year and major version are user-controlled. Version 1.04 is the current implemented and tested development version.
+The initial development year and major version are user-controlled. Version 1.07 is the current implemented and tested development version.
 
 
 ## Dependencies
 
 Build environment verified on Debian with GCC.
 
-Main dependencies:
+Main server dependencies:
 
 ```text
 libc
 libcjson.so.1
 ```
+
+`mcp_agent` additionally uses libcurl.
 
 The system already provides cJSON headers at:
 
@@ -107,10 +125,11 @@ make
 
 The Makefile currently builds with strict warnings and optimization.
 
-Expected output binary:
+Expected output binaries:
 
 ```text
 /home/tools/mcp/work/mymcp/mymcp
+/home/tools/mcp/work/mymcp/mcp_agent
 ```
 
 The build should finish with zero compiler warnings before deployment.
@@ -118,23 +137,21 @@ The build should finish with zero compiler warnings before deployment.
 
 ## Tests
 
-A regression test exists at:
+`test_mymcp.py` is the permanent regression test for the server. It runs a separate local instance on port 18080 and exercises discovery, all file/blob tools, synchronous and asynchronous jobs, ownership isolation, path protection and an end-to-end fake-agent `agent_call`.
 
-```text
-/home/tools/mcp/work/mymcp/test_mymcp.py
-```
-
-It is a development/test helper only. It is not part of the production MCP runtime.
-
-Run it from the project directory:
+The agent part requires an isolated test configuration. From the project directory:
 
 ```sh
+rm -rf tmpdata/regression
+mkdir -p tmpdata/regression/agent
+printf '%s\n' 'test-agent test-token test' > tmpdata/regression/agent.conf
+MYMCP_AGENT_CONFIG="$PWD/tmpdata/regression/agent.conf" \
+MYMCP_AGENT_DIR="$PWD/tmpdata/regression/agent" \
 python3 test_mymcp.py
+rm -rf tmpdata/regression testdata
 ```
 
-The test exercises discovery, tool listing, synchronous commands, asynchronous jobs, tail/status/stop, path protection and job listing.
-
-When changing MCP schemas, job semantics or logging, update and rerun this test.
+Run the regression test after changes to protocol, tools, jobs or agent transport.
 
 
 ## Deployment
@@ -179,7 +196,7 @@ sudo systemctl status mcp.service --no-pager
 The installed binary can be checked for the expected version, for example:
 
 ```sh
-strings /home/tools/mcp/mymcp | grep '^1\.01$'
+strings /home/tools/mcp/mymcp | grep '^1\.07$'
 ```
 
 The user may need to refresh the ChatGPT MCP/plugin interface after tool schemas change. Existing chats sometimes retain a stale tool schema even after refresh; a new chat may be required. This is a client/session cache issue, not necessarily a server issue.
@@ -223,18 +240,22 @@ The response form mirrors the prior working server and includes both text `conte
 
 ## Available tools
 
-The server exposes 9 tools:
+The server exposes 13 tools:
 
 ```text
 hello
 write_file
 read_file
+list_files
+read_blob
+write_blob
 run
 start
 status
 tail
 stop
 jobs
+agent_call
 ```
 
 A more user-oriented command manual is stored at:
@@ -248,9 +269,7 @@ That manual is maintained with the current runtime behavior and should be kept s
 
 ## Mandatory `chat` parameter
 
-Version 1.01 introduced a mandatory `chat` argument for every tool call.
-
-The purpose is to identify which conversation is using the MCP server and make logs/job ownership understandable across multiple clients or chats.
+Every tool call requires a `chat` argument to identify which conversation is using the server and to keep logs and job ownership understandable across clients or chats.
 
 Rules:
 
@@ -332,6 +351,21 @@ read_file(chat="mymcp",path="project/file.txt")
 ```
 
 Paths outside the work root are rejected.
+
+
+### list_files
+
+Lists files and directories below a path inside the work root, optionally recursively. Paths outside the work root are rejected.
+
+
+### read_blob
+
+Reads a binary-safe file chunk below the work root and returns it as base64 together with offset/length metadata.
+
+
+### write_blob
+
+Writes a base64-supplied binary chunk below the work root, with explicit offset and optional truncation. Path protection is the same as for the text file tools.
 
 
 ### run
@@ -504,24 +538,6 @@ chat=legacy
 ```
 
 
-## Version 1.04 visible job storage
-
-Version 1.04 changes persistent job storage from the hidden Unix directory:
-
-```text
-/home/tools/mcp/work/.jobs/
-```
-
-to the visible directory:
-
-```text
-/home/tools/mcp/work/jobs/
-```
-
-This is a visibility and usability change only. Job semantics are unchanged. Each `job_...` directory still contains `meta.json`, `stdout.log`, `stderr.log` and, after completion, `exit_code`. `meta.json` remains the authoritative mapping from a job ID to its owning chat, command, cwd, PID/PGID and timestamps.
-
-Production migration is performed explicitly while no jobs are active by renaming `.jobs` to `jobs`.
-
 ## Job storage
 
 Persistent asynchronous job state is stored under:
@@ -539,14 +555,12 @@ jobs/job_a1b2c3d4e5f6/stderr.log
 jobs/job_a1b2c3d4e5f6/exit_code
 ```
 
-`meta.json` contains the chat owner in version 1.01.
-
-Do not assume that job PID and job ID are interchangeable.
+`meta.json` contains the owning chat together with process and command metadata. Do not assume that job PID and job ID are interchangeable.
 
 
 ## Request logging
 
-Version 1.01 added MCP request logging. Version 1.02 turns it into a more useful audit trail by recording the operational arguments of tool calls while still avoiding file contents and command output.
+MCP request logging records operational tool arguments while avoiding file contents and command output.
 
 Production log file:
 
@@ -581,6 +595,9 @@ Tool-specific audit fields are:
 hello       tool_error
 read_file   path, tool_error
 write_file  path, bytes, tool_error
+list_files  path, recursive, tool_error
+read_blob   path, offset, length, tool_error
+write_blob  path, offset, base64_chars, truncate, tool_error
 run         cwd, command, exit_code when available, tool_error
 start       cwd, command, job_id when available, tool_error
 status      job_id, tool_error
@@ -603,7 +620,7 @@ The audit logger deliberately does **not** record:
 
 For `run` and `start`, the shell command itself is intentionally logged because it is the most important information for auditing what an autonomous client asked the server to execute. Logged quoted values are normalized to one line and limited to 2048 characters each. Quotes and backslashes are escaped.
 
-A command may itself contain a secret such as a token or password; if so, that secret can appear in the audit log. Avoid putting credentials directly on command lines. Automatic credential redaction is not implemented in Version 1.02.
+A command may itself contain a secret such as a token or password; if so, that secret can appear in the audit log. Avoid putting credentials directly on command lines. Automatic credential redaction is not implemented.
 
 Useful inspection:
 
@@ -662,11 +679,149 @@ stop(chat="project",job_id="job_...",force=false)
 Use `force=true` only when necessary.
 
 
+## Remote agents
+
+`mymcp` provides a generic request/response transport to remote local agents. The current Mac agent can use a dedicated Chrome instance through CDP on `127.0.0.1:9222`, while the transport itself remains independent of browser-specific modules.
+
+The public HTTP endpoint remains exactly one:
+
+```text
+/mcp
+```
+
+No additional endpoint and no Apache configuration change are required. Normal ChatGPT/MCP traffic follows the existing MCP protocol. Agent traffic is recognized before MCP parsing by the dedicated HTTP headers `X-MCP-Agent`, `X-MCP-Agent-Action` and `X-MCP-Agent-Token`.
+
+The server side exposed to MCP is the general tool:
+
+```text
+agent_call(chat, agent?, module, action, payload?, timeout?)
+```
+
+`module` and `action` are small validated names. `payload` and the returned `result` are arbitrary JSON, so adding a new local capability does not require changing the transport protocol. The optional `agent` selects a specific machine; when omitted, any configured agent providing that module may claim the request. `mymcp` transports requests and results but does not know how a module is implemented. In particular, it does not receive browser cookies or authentication state from a local browser.
+
+The local agent uses long polling. It repeatedly sends an authenticated `wait` request to `/mcp`; `mymcp` holds the connection for up to 25 seconds and returns immediately when suitable work appears. After executing the request, the agent sends a `result` request to the same `/mcp` endpoint. The agent therefore requires no inbound port and works behind NAT or firewalls as long as it can reach the existing HTTPS MCP service.
+
+Agent configuration is read dynamically from:
+
+```text
+/home/tools/mcp/agent.conf
+```
+
+Each non-comment line has three whitespace-separated fields:
+
+```text
+<agent-id> <token> <module1,module2,...>
+```
+
+For example:
+
+```text
+mac1 <token> test,browser,qrz,edistribuzione
+```
+
+The configuration file is read when an agent authenticates and when `agent_call` checks module availability. Adding an agent, changing its token or changing its module list therefore does **not** require restarting `mymcp`. Tokens are never written to the MCP audit log. The existing HTTPS/Apache protection remains the outer transport protection; the per-agent token is an additional application-level identity check.
+
+Runtime requests use a filesystem spool, preserving the existing fork-per-connection architecture without threads, shared memory, databases, Redis or WebSockets:
+
+```text
+/home/tools/mcp/agent/queue/
+/home/tools/mcp/agent/running/
+/home/tools/mcp/agent/done/
+```
+
+A queued request is claimed with an atomic `rename()` into `running`. Results are written into `done`. Request IDs use the `req_<hex>` form. A request already assigned to an agent is not automatically reassigned on timeout, because actions may have side effects and automatic replay could execute them twice. If a request times out before any agent claims it, it is cancelled from the queue.
+
+The agent runtime directory is operational state and is not intended for backup. Like `/home/tools/mcp/work/jobs/`, it may contain transient or historical runtime information rather than source/project data.
+
+### mcp_agent client
+
+Current `mcp_agent` version: **1.33**, deployed on the remote Mac.
+
+`mcp_agent` is the independent local client for the remote-agent transport. It is separate from `mcp_watch`; both programs may use the same Chrome CDP endpoint on `127.0.0.1:9222` when their modules require it. The client currently provides `test/echo`, `browser/read_tab`, `edistribuzione/load_profile.month` and `qrz/webcontact.add`.
+
+`edistribuzione/load_profile.month` retrieves one complete monthly quarter-hour load profile from an already authenticated E-Distribuzione PortaleClienti Chrome session. Payload: `year`, `month`, and optional `magnitude`; the default magnitude is `A+`. Supported magnitudes are `A+`, `A-`, `RI+`, `RC+`, `RI-` and `RC-`. The agent automatically opens the `Curve di carico` page when the authenticated browser is elsewhere in PortaleClienti, waits for the page controls, resolves the actual month/year option values exposed by the current portal UI (including zero-padded month values), synchronizes the four Aura date controls, activates `Modifica periodo` once, observes the Aura `QueryLoadProfile`/continuation response through CDP, and returns the normalized `MappaDailyLoadProfile` as days containing quarter-hour samples. The result also includes the POD read from the already loaded Aura component. A normal 31-day month therefore contains 2976 samples. When `mymcp` receives a successful result for this action, it writes the normalized samples to `mymcp/tmpdata/<POD>_YYYY_MM.csv` with columns `date,time,value`; the first sample is `00:00` and the 96th is `23:45`. The returned result includes `csv_file` when the file is written successfully. No automatic retry is performed. If the authenticated portal context is unavailable or expired, the action fails instead of replaying the request. Browser cookies and authentication material remain local to Chrome/the Mac and are never returned to the server.
+
+`qrz/webcontact.add` implements the authenticated QRZ operation required by qrzweb. Its payload is `callsign` plus `mycall`. The operation runs entirely inside an already authenticated QRZ Chrome context, performs an initial Web Contacts presence check, submits the QRZ add action only when needed, then performs a fresh final verification. It returns structured codes including `ALREADY_PRESENT`, `ADDED`, `NO_BROWSER`, `NO_QRZ_CONTEXT`, `NOT_AUTHENTICATED`, `PROFILE_UNAVAILABLE`, `WEB_CONTACTS_UNAVAILABLE`, `ACTION_FAILED`, `NOT_CONFIRMED`, `TEMPORARY_ERROR` and `INVALID_REQUEST`. Cookies, QRZ session identifiers, hidden form values and authentication material remain local to Chrome/the Mac and are never returned to the server. Because `mcp_agent` executes requests serially, authenticated QRZ actions are serialized by design.
+
+The QRZ operation has been validated end-to-end against a real authenticated QRZ session for the three essential cases: an existing relationship returns `ALREADY_PRESENT` without submitting an add action; a profile with historical Web Contacts but no usable authenticated action returns `WEB_CONTACTS_UNAVAILABLE`; and a real new relationship returns `ADDED` only after a fresh positive verification. Repeating the successful add returns `ALREADY_PRESENT`, confirming real idempotency after a completed action.
+
+By default it uses `https://www.mazzini.org/mcp`, agent ID `mac1`, `~/mcp/token.txt` for the existing outer MCP/Apache authorization and `~/mcp/agent.token` for the per-agent authentication. The endpoint, agent ID and both tokens may also be supplied through environment variables.
+
+Normal mode runs continuously. Diagnostic one-request mode is:
+
+```sh
+./mcp_agent --once
+```
+
+`--once` means one **completed request**, not one long-poll cycle: idle long-poll expirations simply cause another `wait`; the process exits only after it has received, executed and returned one request.
+
+The current Version 1.07 server passes the full regression suite on a separate local port, including the end-to-end fake-agent exchange (`agent_call -> wait -> result`), wrong agent authentication and unavailable modules.
+
+
+## mcp_watch
+
+Current `mcp_watch` version: **1.05**.
+
+`mcp_watch` is the local macOS helper that watches MCP asynchronous jobs and sends `check` to the corresponding open ChatGPT conversation through Chrome DevTools Protocol. It is intentionally simple and stateless on disk.
+
+Normal use is:
+
+```sh
+./mcp_watch
+```
+
+Every 60 seconds it scans the dedicated Chrome instance exposed on port `9222`, discovers all open ChatGPT conversation tabs and extracts each conversation ID from its `/c/<id>` URL. It then queries MCP `jobs` for the chat associated with each selected tab.
+
+### Chat title convention
+
+The browser tab title is part of the operating convention and must be either:
+
+```text
+<chat>
+<chat> <number>
+```
+
+Examples:
+
+```text
+collatz
+collatz 17
+collatz 18
+dts 03
+```
+
+The first word is always the MCP `chat` name. The optional second word is a non-negative decimal conversation number.
+
+If only one tab exists for a chat, that tab is monitored. If several open tabs have the same chat name, **only the tab with the highest number is considered active and monitored**. This is a deliberate workflow constraint: for example, with `collatz 17` and `collatz 18` open, `mcp_watch` works only with `collatz 18`. An unnumbered tab has number `0`. Two different tabs with the same chat name and the same highest number are ambiguous; monitoring for that chat is suspended rather than choosing arbitrarily.
+
+When the selected highest-numbered conversation changes, its previous in-memory watcher state is discarded and the newly selected conversation starts from a fresh initial snapshot.
+
+### Job notification semantics
+
+All watcher state is kept only in memory. `mcp_watch` does not use baseline files, per-job marker files or any other persistent watcher state.
+
+When a conversation is selected for the first time, jobs already in `exited` state are treated as historical and are not notified. Jobs already `running` are remembered. After that initial snapshot, a tracked job changing from `running` to `exited`, or a new job first appearing as already `exited` between two scans, causes one `check` to be sent to the selected ChatGPT conversation. The job ID is remembered in memory so the same completion is not notified twice during that `mcp_watch` process.
+
+If a selected tab disappears, its state is discarded. If it is opened again later, it starts from a new initial snapshot. Consequently, work completed while that conversation was not being watched is intentionally not reported automatically. When resuming an old conversation, the user performs a manual `check` if needed.
+
+Long-running work must be started with MCP `start`, never with `run` plus `nohup`, `&`, `screen`, `tmux` or another detached-process mechanism. Only an MCP `start` job has the MCP `job_id` required for reliable tracking.
+
+### Diagnostic mode
+
+```sh
+./mcp_watch --query
+```
+
+This performs one discovery/query pass, shows the selected ChatGPT conversations and their running MCP jobs, and sends no `check`.
+
+### Release rule
+
+Every functional modification to `mcp_watch` increments its release number in both the source header and `MCP_CLIENT_VERSION`. The README must be updated whenever its current behavior or operating conventions change.
+
+
 ## Agent strategy published by server/discover
 
-Version 1.03 publishes concise operational guidance directly in MCP discovery instructions so a new chat can work safely without relying on previous conversation history.
-
-Normal strategy for long-running work:
+MCP discovery publishes concise operational guidance so a new chat can work safely without relying on previous conversation history. Normal strategy for long-running work:
 
 ```text
 start(...) -> status()/tail()/read_file() -> validate -> next action
@@ -697,45 +852,6 @@ Therefore system/user file protection should also rely on standard Unix ownershi
 A stricter sandbox for `run/start` was discussed but intentionally not implemented yet.
 
 
-## Tool annotations and confirmation prompts
-
-ChatGPT may ask the user to confirm some write/action calls, for example `write_file`.
-
-A future version may add MCP Tool Annotations such as:
-
-```text
-readOnlyHint
-destructiveHint
-idempotentHint
-openWorldHint
-```
-
-These annotations are NOT currently the main security boundary and do not automatically eliminate user confirmations.
-
-Potential classification discussed for a future version:
-
-```text
-hello      read-only
-read_file  read-only
-status     read-only
-tail       read-only
-jobs       read-only
-write_file write/destructive-capable
-run        powerful shell action
-start      powerful shell action
-stop       process-control action
-```
-
-Do not claim this future annotation work is implemented unless the source has actually been changed and tested.
-
-
-## Mobile ChatGPT note
-
-Conversation history can continue across ChatGPT web/mobile for the same account, but custom MCP app availability may differ by client. If MCP tools are unavailable in a mobile session, continue conversational work there and resume MCP operations from a supported client.
-
-This is a client capability issue, not a mymcp server failure.
-
-
 ## Known operational behavior
 
 - ChatGPT sessions may cache the old tool schema.
@@ -750,14 +866,14 @@ This is a client capability issue, not a mymcp server failure.
 At the time this document was written:
 
 - The C implementation is stable and in production.
-- Development version 1.02 has been built and regression-tested; production remains whatever binary is currently installed until the user deploys it.
+- Production `mymcp` is Version 1.07. Production `mcp_agent` on the remote Mac is Version 1.33. The agent provides the established `test/echo`, `browser/read_tab` and `qrz/webcontact.add` functions plus `edistribuzione/load_profile.month`; the E-Distribuzione result includes the POD, and `mymcp` stores successful monthly profiles in `mymcp/tmpdata/<POD>_YYYY_MM.csv`. Existing agent functions remain unchanged in behavior.
 - The production service executes `/home/tools/mcp/mymcp`.
 - The Python MCP virtualenv, Python SDK checkout, old `server.py` and related MCP Python runtime files were removed.
 - The C binary uses cJSON and libc.
-- All 9 tools work.
+- All 13 MCP tools work, including `agent_call`.
 - `chat` is mandatory.
 - Job ownership by chat works.
-- Request logging is enabled at `/home/tools/mcp/mcp.log`; Version 1.02 adds operational audit fields without logging file contents or command output.
+- Request logging is enabled at `/home/tools/mcp/mcp.log` with operational audit fields that do not log file contents or command output.
 - The development binary/source remain under `/home/tools/mcp/work/mymcp`.
 - The command manual is `/home/tools/mcp/work/GMmcp2.txt`.
 
@@ -779,20 +895,8 @@ At the time this document was written:
 13. Preserve the mandatory `chat` semantics unless the user explicitly changes the design.
 14. Preserve job ownership isolation between chats.
 15. Preserve request logging unless the user explicitly changes it.
-16. Preserve the Version 1.02 audit policy: log operational paths/parameters and the `run/start` command (up to 2048 characters), but never log file contents, stdout/stderr or complete JSON payloads by default.
+16. Preserve the audit policy: log operational paths/parameters and the `run/start` command (up to 2048 characters), but never log file contents, stdout/stderr or complete JSON payloads by default.
 17. Remember that `run/start` are not currently filesystem-sandboxed beyond Unix permissions and constrained working directory.
 18. Do not remove or alter unrelated project files under `work/`.
 19. If ChatGPT shows stale tools, verify the server directly before modifying code.
 20. For this conversation/project, use `chat="mymcp"` when calling tools.
-
-
-## Possible future work
-
-These ideas were discussed but are not implemented unless the source says otherwise:
-
-- MCP Tool Annotations to better describe read-only/destructive/idempotent/open-world behavior.
-- Stronger confinement of `run` and `start` using Landlock or another sandbox mechanism.
-- Additional log management/rotation if `mcp.log` grows significantly.
-- Additional client interoperability testing with Gemini CLI/API or other MCP clients.
-
-Do not implement these automatically. Re-evaluate requirements with the user first.
