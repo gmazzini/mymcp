@@ -2,7 +2,7 @@
 
 ## Project status
 
-Current version: **1.07**
+Current development version: **1.09**
 
 `mymcp` is a small MCP server written in C and designed to replace the previous Python MCP server that used the official Python MCP SDK.
 
@@ -12,10 +12,12 @@ The active production service is expected to run:
 /home/tools/mcp/mymcp
 ```
 
-The development source of truth is:
+The development sources of truth are:
 
 ```text
 /home/tools/mcp/work/mymcp/mymcp.c
+/home/tools/mcp/work/mymcp/mcp_drive.c
+/home/tools/mcp/work/mymcp/mcp_drive.h
 ```
 
 The project directory is:
@@ -80,10 +82,10 @@ The source follows the user's C style rules.
 - Source header format is:
 
 ```c
-// Gianluca Mazzini @2026- Version 1.07
+// Gianluca Mazzini @2026- Version 1.09
 ```
 
-The initial development year and major version are user-controlled. Version 1.07 is the current implemented and tested development version.
+The initial development year and major version are user-controlled. Version 1.09 is the current implemented and tested development version.
 
 
 ## Dependencies
@@ -95,9 +97,10 @@ Main server dependencies:
 ```text
 libc
 libcjson.so.1
+libcurl
 ```
 
-`mcp_agent` additionally uses libcurl.
+`mcp_agent` also uses libcurl.
 
 The system already provides cJSON headers at:
 
@@ -137,7 +140,7 @@ The build should finish with zero compiler warnings before deployment.
 
 ## Tests
 
-`test_mymcp.py` is the permanent regression test for the server. It runs a separate local instance on port 18080 and exercises discovery, all file/blob tools, synchronous and asynchronous jobs, ownership isolation, path protection and an end-to-end fake-agent `agent_call`.
+`test_mymcp.py` is the permanent regression test for the server. It runs a separate local instance on port 18080 and exercises discovery, all local file/blob tools, Google Drive tools through an isolated mock Drive API, synchronous and asynchronous jobs, ownership isolation, path protection and an end-to-end fake-agent `agent_call`.
 
 The agent part requires an isolated test configuration. From the project directory:
 
@@ -196,7 +199,7 @@ sudo systemctl status mcp.service --no-pager
 The installed binary can be checked for the expected version, for example:
 
 ```sh
-strings /home/tools/mcp/mymcp | grep '^1\.07$'
+strings /home/tools/mcp/mymcp | grep '^1\.09$'
 ```
 
 The user may need to refresh the ChatGPT MCP/plugin interface after tool schemas change. Existing chats sometimes retain a stale tool schema even after refresh; a new chat may be required. This is a client/session cache issue, not necessarily a server issue.
@@ -240,7 +243,7 @@ The response form mirrors the prior working server and includes both text `conte
 
 ## Available tools
 
-The server exposes 13 tools:
+The development server exposes 20 tools:
 
 ```text
 hello
@@ -249,6 +252,13 @@ read_file
 list_files
 read_blob
 write_blob
+drive_list
+drive_stat
+drive_read_blob
+drive_write_blob
+drive_mkdir
+drive_rename
+drive_delete
 run
 start
 status
@@ -366,6 +376,55 @@ Reads a binary-safe file chunk below the work root and returns it as base64 toge
 ### write_blob
 
 Writes a base64-supplied binary chunk below the work root, with explicit offset and optional truncation. Path protection is the same as for the text file tools.
+
+
+### Google Drive tools
+
+Google Drive is accessed directly through the Google Drive API. It is not mounted as a filesystem.
+
+Authorized roots are configured outside the MCP work tree in:
+
+```text
+/home/tools/mcp/drive.map
+```
+
+The map is read and fully validated on every Drive tool call, so authorization changes take effect without restarting `mymcp`. Every non-comment line has exactly three fields:
+
+```text
+<alias> <google-folder-id> <ro|rw>
+```
+
+Example:
+
+```text
+garr 1AbCdEf... rw
+ari  1XyZ...    rw
+archive 1Qwerty... ro
+```
+
+Only paths below the configured folder IDs can be reached through Drive tools. The alias is the first path component, for example `garr/NIS2/relazione.docx`. Duplicate names inside one Drive folder make a path ambiguous and are rejected rather than guessed.
+
+The OAuth access token is read from:
+
+```text
+/home/www/data/google_access_token
+```
+
+Binary write sessions use private staging outside the normal work tree:
+
+```text
+/home/tools/mcp/drive-stage
+```
+
+Production setup must create that directory as `mcp:mcp` mode `0700`. The staging area is not exposed by the normal work-directory tools.
+
+`drive_list(path,recursive=false)` lists an authorized folder. `drive_stat(path)` returns item metadata including the Drive `version`, which can be used for optimistic concurrency checks. `drive_read_blob(path,offset,length)` reads ordinary binary Drive files in base64 chunks. Google-native Docs/Sheets/Slides are deliberately not exported by this interface; the current target is ordinary files such as `.docx` and `.pdf` stored in Drive.
+
+`drive_write_blob` replaces or creates an ordinary Drive file using chunks of at most 1 MiB. A write session starts with `truncate=true` and `offset=0`. For a one-chunk file, use `commit=true`. For a multi-chunk file, use `commit=false` for every non-final chunk and `commit=true` on the final chunk. The server captures the target Drive version when staging begins and checks it again before commit. If another writer changed or created the target in the meantime, commit fails and leaves the staged data available for a deliberate retry instead of overwriting the newer Drive file. Optional `expected_version` can enforce the version already observed by the caller before staging begins.
+
+`drive_mkdir(path)` creates a folder under an `rw` alias. `drive_rename(path,new_name,expected_version?)` changes only the item's name, not its parent. `drive_delete(path,expected_version?)` moves the item to Google Drive trash; it does not permanently delete it. Rename and delete of a configured root alias are prohibited. All modifying operations are rejected on `ro` aliases.
+
+For tests, the Drive map, token, staging directory and API endpoints can be overridden with `MYMCP_DRIVE_MAP`, `MYMCP_DRIVE_TOKEN`, `MYMCP_DRIVE_STAGE`, `MYMCP_DRIVE_API` and `MYMCP_DRIVE_UPLOAD_API`. The regression suite uses these overrides only against its local mock server.
 
 
 ### run
@@ -597,8 +656,15 @@ read_file   path, tool_error
 write_file  path, bytes, tool_error
 list_files  path, recursive, tool_error
 read_blob   path, offset, length, tool_error
-write_blob  path, offset, base64_chars, truncate, tool_error
-run         cwd, command, exit_code when available, tool_error
+write_blob       path, offset, base64_chars, truncate, tool_error
+drive_list       path, recursive, tool_error
+drive_stat       path, tool_error
+drive_read_blob  path, offset, length, tool_error
+drive_write_blob path, offset, base64_chars, truncate, commit, tool_error
+drive_mkdir      path, tool_error
+drive_rename     path, new_name, tool_error
+drive_delete     path, tool_error
+run              cwd, command, exit_code when available, tool_error
 start       cwd, command, job_id when available, tool_error
 status      job_id, tool_error
 tail        job_id, stream, lines, tool_error
@@ -755,7 +821,7 @@ Normal mode runs continuously. Diagnostic one-request mode is:
 
 `--once` means one **completed request**, not one long-poll cycle: idle long-poll expirations simply cause another `wait`; the process exits only after it has received, executed and returned one request.
 
-The current Version 1.07 server passes the full regression suite on a separate local port, including the end-to-end fake-agent exchange (`agent_call -> wait -> result`), wrong agent authentication and unavailable modules.
+The current Version 1.09 development server passes the full regression suite on a separate local port, including the end-to-end fake-agent exchange (`agent_call -> wait -> result`), wrong agent authentication and unavailable modules.
 
 
 ## mcp_watch
@@ -845,6 +911,8 @@ The MCP service runs as Unix user/group `mcp:mcp`.
 
 `read_file` and `write_file` explicitly restrict paths to `/home/tools/mcp/work`.
 
+Google Drive tools are a separate backend. They can reach only the folder roots named in `/home/tools/mcp/drive.map`; that map is outside `work` and cannot be changed through the normal file tools. The private Drive staging directory is also outside `work`.
+
 `run` and `start` restrict `cwd` to the work root, but commands execute with normal Linux permissions of the `mcp` account.
 
 Therefore system/user file protection should also rely on standard Unix ownership and mode bits where appropriate.
@@ -866,11 +934,11 @@ A stricter sandbox for `run/start` was discussed but intentionally not implement
 At the time this document was written:
 
 - The C implementation is stable and in production.
-- Production `mymcp` is Version 1.07. Production `mcp_agent` on the remote Mac is Version 1.33. The agent provides the established `test/echo`, `browser/read_tab` and `qrz/webcontact.add` functions plus `edistribuzione/load_profile.month`; the E-Distribuzione result includes the POD, and `mymcp` stores successful monthly profiles in `mymcp/tmpdata/<POD>_YYYY_MM.csv`. Existing agent functions remain unchanged in behavior.
+- Production `mymcp` is Version 1.08. Development Version 1.09 adds the native Google Drive backend and has not been deployed by this development step. Production `mcp_agent` on the remote Mac is Version 1.33. The agent provides the established `test/echo`, `browser/read_tab` and `qrz/webcontact.add` functions plus `edistribuzione/load_profile.month`; the E-Distribuzione result includes the POD, and `mymcp` stores successful monthly profiles in `mymcp/tmpdata/<POD>_YYYY_MM.csv`. Existing agent functions remain unchanged in behavior.
 - The production service executes `/home/tools/mcp/mymcp`.
 - The Python MCP virtualenv, Python SDK checkout, old `server.py` and related MCP Python runtime files were removed.
-- The C binary uses cJSON and libc.
-- All 13 MCP tools work, including `agent_call`.
+- The C binary uses cJSON, libcurl and libc.
+- Production 1.08 exposes the pre-Drive toolset. Development 1.09 exposes 20 MCP tools, including seven native Drive tools and `agent_call`.
 - `chat` is mandatory.
 - Job ownership by chat works.
 - Request logging is enabled at `/home/tools/mcp/mcp.log` with operational audit fields that do not log file contents or command output.
@@ -880,7 +948,7 @@ At the time this document was written:
 
 ## Rules for a future assistant/chat continuing development
 
-1. Treat `/home/tools/mcp/work/mymcp/mymcp.c` as the development source of truth.
+1. Treat `/home/tools/mcp/work/mymcp/mymcp.c` together with `mcp_drive.c` / `mcp_drive.h` as the development source of truth for the server and Drive backend.
 2. Read the actual current source before changing behavior.
 3. Keep all mymcp development files inside `/home/tools/mcp/work/mymcp`.
 4. Keep unrelated projects in their own subdirectories under `/home/tools/mcp/work`.

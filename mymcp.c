@@ -1,7 +1,8 @@
-// Gianluca Mazzini @2026- Version 1.08
+// Gianluca Mazzini @2026- Version 1.09
 
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
+#include "mcp_drive.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -23,7 +24,7 @@
 #include <unistd.h>
 
 #define SERVER_NAME "mymcp"
-#define SERVER_VERSION "1.08"
+#define SERVER_VERSION "1.09"
 #define PROTOCOL_VERSION "2026-07-28"
 #define WORK_DIR "/home/tools/mcp/work"
 #ifndef JOBS_DIR
@@ -1319,6 +1320,61 @@ static cJSON *build_tools(void) {
   require_field(tool,"data_base64");
   cJSON_AddItemToArray(tools,tool);
 
+  tool=new_tool("drive_list","List files and folders below an authorized Google Drive path.");
+  add_property(tool,"path",schema_string());
+  add_property(tool,"recursive",schema_boolean(0,1));
+  require_field(tool,"path");
+  cJSON_AddItemToArray(tools,tool);
+
+  tool=new_tool("drive_stat","Return metadata and version for an authorized Google Drive item.");
+  add_property(tool,"path",schema_string());
+  require_field(tool,"path");
+  cJSON_AddItemToArray(tools,tool);
+
+  tool=new_tool("drive_read_blob","Read a binary-safe chunk from an authorized Google Drive file.");
+  add_property(tool,"path",schema_string());
+  s=schema_integer(0,1);
+  cJSON_AddNumberToObject(s,"minimum",0);
+  add_property(tool,"offset",s);
+  s=schema_integer(MAX_BLOB_CHUNK,1);
+  cJSON_AddNumberToObject(s,"minimum",1);
+  cJSON_AddNumberToObject(s,"maximum",MAX_BLOB_CHUNK);
+  add_property(tool,"length",s);
+  require_field(tool,"path");
+  cJSON_AddItemToArray(tools,tool);
+
+  tool=new_tool("drive_write_blob","Stage and optionally commit a binary chunk to an authorized writable Google Drive file. Start a replacement with truncate=true; use commit=false until the final chunk.");
+  add_property(tool,"path",schema_string());
+  s=schema_integer(0,1);
+  cJSON_AddNumberToObject(s,"minimum",0);
+  add_property(tool,"offset",s);
+  add_property(tool,"data_base64",schema_string());
+  add_property(tool,"truncate",schema_boolean(0,1));
+  add_property(tool,"commit",schema_boolean(1,1));
+  add_property(tool,"expected_version",schema_string());
+  require_field(tool,"path");
+  require_field(tool,"data_base64");
+  cJSON_AddItemToArray(tools,tool);
+
+  tool=new_tool("drive_mkdir","Create a folder below an authorized writable Google Drive path.");
+  add_property(tool,"path",schema_string());
+  require_field(tool,"path");
+  cJSON_AddItemToArray(tools,tool);
+
+  tool=new_tool("drive_rename","Rename an item below an authorized writable Google Drive path without moving it.");
+  add_property(tool,"path",schema_string());
+  add_property(tool,"new_name",schema_string());
+  add_property(tool,"expected_version",schema_string());
+  require_field(tool,"path");
+  require_field(tool,"new_name");
+  cJSON_AddItemToArray(tools,tool);
+
+  tool=new_tool("drive_delete","Move an item below an authorized writable Google Drive path to the Drive trash.");
+  add_property(tool,"path",schema_string());
+  add_property(tool,"expected_version",schema_string());
+  require_field(tool,"path");
+  cJSON_AddItemToArray(tools,tool);
+
   tool=new_tool("run","Run a shell command as the mcp user and return exit code, stdout and stderr.");
   add_property(tool,"command",schema_string());
   s=schema_string();
@@ -1393,7 +1449,7 @@ static cJSON *handle_discover(void) {
   caps=cJSON_AddObjectToObject(result,"capabilities");
   tools=cJSON_AddObjectToObject(caps,"tools");
   cJSON_AddBoolToObject(tools,"listChanged",0);
-  cJSON_AddStringToObject(result,"instructions","mymcp provides file, shell and asynchronous job tools inside /home/tools/mcp/work. Every tool call requires a chat name (1-64 characters: A-Z, a-z, 0-9, _, -, .). If the chat name is not already known, ask the user to choose it before the first tool call and reuse the same value for that conversation. For long-running work, use start() to launch the process and use status(), tail() or read_file() for observations. A synchronous run() containing sleep, delayed wait-then-observe commands, or polling loops is technically possible, but this pattern can consume Work/Codex usage heavily. Never use that delayed-wait strategy unless the owner has explicitly authorized it for the current task. Without explicit owner authorization, do not use sleep-based or delayed polling calls.");
+  cJSON_AddStringToObject(result,"instructions","mymcp provides file, shell and asynchronous job tools inside /home/tools/mcp/work, plus explicitly authorized Google Drive folder tools configured outside the work tree. Every tool call requires a chat name (1-64 characters: A-Z, a-z, 0-9, _, -, .). If the chat name is not already known, ask the user to choose it before the first tool call and reuse the same value for that conversation. For long-running work, use start() to launch the process and use status(), tail() or read_file() for observations. A synchronous run() containing sleep, delayed wait-then-observe commands, or polling loops is technically possible, but this pattern can consume Work/Codex usage heavily. Never use that delayed-wait strategy unless the owner has explicitly authorized it for the current task. Without explicit owner authorization, do not use sleep-based or delayed polling calls.");
   cJSON_AddStringToObject(result,"resultType","complete");
   versions=cJSON_AddArrayToObject(result,"supportedVersions");
   cJSON_AddItemToArray(versions,cJSON_CreateString(PROTOCOL_VERSION));
@@ -1498,7 +1554,7 @@ static void build_tool_log_detail(const char *name,cJSON *args,cJSON *result,
   cJSON *item,*structured;
   const char *path,*command,*cwd,*job_id,*stream;
   char q1[LOG_VALUE_MAX+8],q2[LOG_VALUE_MAX+8];
-  int lines,limit,force,exit_code,is_error,recursive,truncate,length;
+  int lines,limit,force,commit,exit_code,is_error,recursive,truncate,length;
   long offset;
   size_t bytes;
 
@@ -1507,7 +1563,7 @@ static void build_tool_log_detail(const char *name,cJSON *args,cJSON *result,
   if(name==NULL || !cJSON_IsObject(args)) return;
   is_error=tool_result_is_error(result);
   path=NULL; command=NULL; cwd="."; job_id=NULL; stream="stdout";
-  lines=50; limit=100; force=0; recursive=1; truncate=0; length=MAX_BLOB_CHUNK; offset=0; bytes=0;
+  lines=50; limit=100; force=0; commit=1; recursive=1; truncate=0; length=MAX_BLOB_CHUNK; offset=0; bytes=0;
 
   if(strcmp(name,"write_file")==0) {
     get_string_arg(args,"path",&path,0);
@@ -1538,6 +1594,36 @@ static void build_tool_log_detail(const char *name,cJSON *args,cJSON *result,
     if(cJSON_IsString(item) && item->valuestring!=NULL) bytes=strlen(item->valuestring);
     log_quote_value(path,q1,sizeof(q1));
     snprintf(out,out_size,"path=%s offset=%ld base64_chars=%lu truncate=%s tool_error=%s",q1,offset,(unsigned long)bytes,truncate?"true":"false",is_error?"true":"false");
+  } else if(strcmp(name,"drive_list")==0) {
+    get_string_arg(args,"path",&path,0);
+    get_bool_arg(args,"recursive",&recursive,0);
+    log_quote_value(path,q1,sizeof(q1));
+    snprintf(out,out_size,"path=%s recursive=%s tool_error=%s",q1,recursive?"true":"false",is_error?"true":"false");
+  } else if(strcmp(name,"drive_stat")==0 || strcmp(name,"drive_mkdir")==0 || strcmp(name,"drive_delete")==0) {
+    get_string_arg(args,"path",&path,0);
+    log_quote_value(path,q1,sizeof(q1));
+    snprintf(out,out_size,"path=%s tool_error=%s",q1,is_error?"true":"false");
+  } else if(strcmp(name,"drive_read_blob")==0) {
+    get_string_arg(args,"path",&path,0);
+    get_long_arg(args,"offset",&offset,0);
+    get_int_arg(args,"length",&length,MAX_BLOB_CHUNK);
+    log_quote_value(path,q1,sizeof(q1));
+    snprintf(out,out_size,"path=%s offset=%ld length=%d tool_error=%s",q1,offset,length,is_error?"true":"false");
+  } else if(strcmp(name,"drive_write_blob")==0) {
+    get_string_arg(args,"path",&path,0);
+    get_long_arg(args,"offset",&offset,0);
+    get_bool_arg(args,"truncate",&truncate,0);
+    get_bool_arg(args,"commit",&commit,1);
+    item=cJSON_GetObjectItemCaseSensitive(args,"data_base64");
+    if(cJSON_IsString(item) && item->valuestring!=NULL) bytes=strlen(item->valuestring);
+    log_quote_value(path,q1,sizeof(q1));
+    snprintf(out,out_size,"path=%s offset=%ld base64_chars=%lu truncate=%s commit=%s tool_error=%s",q1,offset,(unsigned long)bytes,truncate?"true":"false",commit?"true":"false",is_error?"true":"false");
+  } else if(strcmp(name,"drive_rename")==0) {
+    get_string_arg(args,"path",&path,0);
+    get_string_arg(args,"new_name",&command,0);
+    log_quote_value(path,q1,sizeof(q1));
+    log_quote_value(command,q2,sizeof(q2));
+    snprintf(out,out_size,"path=%s new_name=%s tool_error=%s",q1,q2,is_error?"true":"false");
   } else if(strcmp(name,"run")==0) {
     get_string_arg(args,"command",&command,0);
     get_string_arg(args,"cwd",&cwd,0);
@@ -1779,6 +1865,130 @@ static cJSON *tool_write_blob(cJSON *args) {
   cJSON_AddNumberToObject(data,"offset",(double)offset);
   cJSON_AddNumberToObject(data,"length",(double)len);
   cJSON_AddNumberToObject(data,"size",(double)st.st_size);
+  return tool_result_json(data,0);
+}
+
+static cJSON *tool_drive_list(cJSON *args) {
+  const char *path;
+  cJSON *data;
+  char error[512];
+  int recursive;
+
+  path=NULL;
+  recursive=0;
+  if(get_string_arg(args,"path",&path,1)<0) return tool_result_string("invalid argument: path is required",1);
+  if(get_bool_arg(args,"recursive",&recursive,0)<0) return tool_result_string("invalid argument: recursive must be boolean",1);
+  data=NULL;
+  if(!mcp_drive_list(path,recursive,&data,error,sizeof(error))) return tool_result_string(error,1);
+  return tool_result_json(data,0);
+}
+
+static cJSON *tool_drive_stat(cJSON *args) {
+  const char *path;
+  cJSON *data;
+  char error[512];
+
+  path=NULL;
+  if(get_string_arg(args,"path",&path,1)<0) return tool_result_string("invalid argument: path is required",1);
+  data=NULL;
+  if(!mcp_drive_stat(path,&data,error,sizeof(error))) return tool_result_string(error,1);
+  return tool_result_json(data,0);
+}
+
+static cJSON *tool_drive_read_blob(cJSON *args) {
+  const char *path;
+  cJSON *data;
+  char error[512];
+  long offset;
+  int length;
+
+  path=NULL;
+  offset=0;
+  length=MAX_BLOB_CHUNK;
+  if(get_string_arg(args,"path",&path,1)<0) return tool_result_string("invalid argument: path is required",1);
+  if(get_long_arg(args,"offset",&offset,0)<0 || offset<0) return tool_result_string("invalid argument: offset must be a non-negative integer",1);
+  if(get_int_arg(args,"length",&length,MAX_BLOB_CHUNK)<0 || length<1 || length>MAX_BLOB_CHUNK) return tool_result_string("invalid argument: length out of range",1);
+  data=NULL;
+  if(!mcp_drive_read_blob(path,offset,length,&data,error,sizeof(error))) return tool_result_string(error,1);
+  return tool_result_json(data,0);
+}
+
+static cJSON *tool_drive_write_blob(cJSON *args) {
+  const char *chat,*path,*text,*expected_version;
+  unsigned char *buf;
+  cJSON *data;
+  char error[512];
+  long offset;
+  size_t len;
+  int truncate,commit;
+
+  chat=NULL;
+  path=NULL;
+  text=NULL;
+  expected_version=NULL;
+  offset=0;
+  truncate=0;
+  commit=1;
+  if(get_string_arg(args,"chat",&chat,1)<0 || get_string_arg(args,"path",&path,1)<0 || get_string_arg(args,"data_base64",&text,1)<0)
+    return tool_result_string("invalid arguments: path and data_base64 are required strings",1);
+  if(get_string_arg(args,"expected_version",&expected_version,0)<0) return tool_result_string("invalid argument: expected_version must be a string",1);
+  if(get_long_arg(args,"offset",&offset,0)<0 || offset<0) return tool_result_string("invalid argument: offset must be a non-negative integer",1);
+  if(get_bool_arg(args,"truncate",&truncate,0)<0) return tool_result_string("invalid argument: truncate must be boolean",1);
+  if(get_bool_arg(args,"commit",&commit,1)<0) return tool_result_string("invalid argument: commit must be boolean",1);
+  buf=base64_decode(text,&len);
+  if(buf==NULL) return tool_result_string("invalid base64 data",1);
+  if(len>MAX_BLOB_CHUNK) {
+    free(buf);
+    return tool_result_string("blob chunk too large",1);
+  }
+  data=NULL;
+  if(!mcp_drive_write_blob(chat,path,expected_version,offset,buf,len,truncate,commit,&data,error,sizeof(error))) {
+    free(buf);
+    return tool_result_string(error,1);
+  }
+  free(buf);
+  return tool_result_json(data,0);
+}
+
+static cJSON *tool_drive_mkdir(cJSON *args) {
+  const char *path;
+  cJSON *data;
+  char error[512];
+
+  path=NULL;
+  if(get_string_arg(args,"path",&path,1)<0) return tool_result_string("invalid argument: path is required",1);
+  data=NULL;
+  if(!mcp_drive_mkdir(path,&data,error,sizeof(error))) return tool_result_string(error,1);
+  return tool_result_json(data,0);
+}
+
+static cJSON *tool_drive_rename(cJSON *args) {
+  const char *path,*new_name,*expected_version;
+  cJSON *data;
+  char error[512];
+
+  path=NULL;
+  new_name=NULL;
+  expected_version=NULL;
+  if(get_string_arg(args,"path",&path,1)<0 || get_string_arg(args,"new_name",&new_name,1)<0)
+    return tool_result_string("invalid arguments: path and new_name are required strings",1);
+  if(get_string_arg(args,"expected_version",&expected_version,0)<0) return tool_result_string("invalid argument: expected_version must be a string",1);
+  data=NULL;
+  if(!mcp_drive_rename(path,new_name,expected_version,&data,error,sizeof(error))) return tool_result_string(error,1);
+  return tool_result_json(data,0);
+}
+
+static cJSON *tool_drive_delete(cJSON *args) {
+  const char *path,*expected_version;
+  cJSON *data;
+  char error[512];
+
+  path=NULL;
+  expected_version=NULL;
+  if(get_string_arg(args,"path",&path,1)<0) return tool_result_string("invalid argument: path is required",1);
+  if(get_string_arg(args,"expected_version",&expected_version,0)<0) return tool_result_string("invalid argument: expected_version must be a string",1);
+  data=NULL;
+  if(!mcp_drive_delete(path,expected_version,&data,error,sizeof(error))) return tool_result_string(error,1);
   return tool_result_json(data,0);
 }
 
@@ -2606,6 +2816,13 @@ static cJSON *dispatch_tool(const char *name,cJSON *args) {
   if(strcmp(name,"list_files")==0) return tool_list_files(args);
   if(strcmp(name,"read_blob")==0) return tool_read_blob(args);
   if(strcmp(name,"write_blob")==0) return tool_write_blob(args);
+  if(strcmp(name,"drive_list")==0) return tool_drive_list(args);
+  if(strcmp(name,"drive_stat")==0) return tool_drive_stat(args);
+  if(strcmp(name,"drive_read_blob")==0) return tool_drive_read_blob(args);
+  if(strcmp(name,"drive_write_blob")==0) return tool_drive_write_blob(args);
+  if(strcmp(name,"drive_mkdir")==0) return tool_drive_mkdir(args);
+  if(strcmp(name,"drive_rename")==0) return tool_drive_rename(args);
+  if(strcmp(name,"drive_delete")==0) return tool_drive_delete(args);
   if(strcmp(name,"run")==0) return tool_run(args);
   if(strcmp(name,"start")==0) return tool_start(args);
   if(strcmp(name,"status")==0) return tool_status(args);
