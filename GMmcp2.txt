@@ -1,0 +1,372 @@
+GMmcp2 COMMAND REFERENCE
+========================
+Development server version: 1.09
+Protocol: 2026-07-28
+
+Overview
+--------
+GMmcp2 exposes the mymcp server to ChatGPT. It provides local file tools under
+/home/tools/mcp/work, synchronous and asynchronous shell execution, remote-agent
+calls, and a native Google Drive backend restricted to explicitly authorized
+folder roots.
+
+Every tool call requires:
+
+  chat="<conversation-name>"
+
+Allowed chat characters are A-Z, a-z, 0-9, _, - and .; maximum length is 64.
+Reuse the same chat value throughout one conversation.
+
+The development toolset contains 20 tools:
+
+  hello
+  write_file
+  read_file
+  list_files
+  read_blob
+  write_blob
+  drive_list
+  drive_stat
+  drive_read_blob
+  drive_write_blob
+  drive_mkdir
+  drive_rename
+  drive_delete
+  run
+  start
+  status
+  tail
+  stop
+  jobs
+  agent_call
+
+
+LOCAL FILE TOOLS
+================
+
+hello
+-----
+Connectivity test.
+
+  hello(chat="mymcp")
+
+
+write_file
+----------
+Write or replace a text file below /home/tools/mcp/work.
+
+  write_file(chat="mymcp", path="project/file.txt", content="text")
+
+Parent directories are created when needed. Path traversal and unsafe symbolic
+link traversal outside the work tree are rejected.
+
+
+read_file
+---------
+Read a regular text file below /home/tools/mcp/work.
+
+  read_file(chat="mymcp", path="project/file.txt")
+
+
+list_files
+----------
+List files and directories below a work-tree directory.
+
+  list_files(chat="mymcp", path="project", recursive=true)
+
+recursive defaults to true.
+
+
+read_blob
+---------
+Read a binary file chunk as base64.
+
+  read_blob(chat="mymcp", path="project/file.bin", offset=0, length=1048576)
+
+Maximum chunk length is 1 MiB.
+
+
+write_blob
+----------
+Write a base64 binary chunk below the work tree.
+
+  write_blob(chat="mymcp", path="project/file.bin",
+             offset=0, data_base64="...", truncate=true)
+
+Maximum decoded chunk size is 1 MiB. truncate=true requires offset=0.
+
+
+GOOGLE DRIVE TOOLS
+==================
+
+Google Drive is accessed directly with Google Drive API v3. It is not mounted
+as a filesystem.
+
+Authorization map:
+
+  /home/tools/mcp/drive.map
+
+Each non-comment line has exactly:
+
+  <alias> <google-folder-id> <ro|rw>
+
+Example:
+
+  garr    1AbCdEf... rw
+  ari     1XyZ...    rw
+  archive 1Qwerty... ro
+
+The map is outside /home/tools/mcp/work and is re-read and fully validated on
+every Drive tool call. Changes therefore take effect without restarting mymcp.
+If the map is missing or malformed, Drive operations fail closed.
+
+Google access tokens are obtained on demand from:
+
+  POST https://google.mazzini.org/googleauth
+  Content-Type: application/x-www-form-urlencoded
+  action=token&channel=mymcp&key=<API_KEY>
+
+The channel key is read from /home/tools/mcp/mymcp.conf:
+
+  googleauth_key=<API_KEY>
+
+Recommended permissions are root:mcp 0640. The key and returned token are never
+logged. OAuth and access-token refresh are handled exclusively by googleauth.
+The legacy /home/www/data/google_access_token file is not used by mymcp.
+
+Binary write staging is private and outside the work tree:
+
+  /home/tools/mcp/drive-stage
+
+Production setup should create it as mcp:mcp mode 0700.
+
+Logical Drive paths always start with an authorized alias, for example:
+
+  garr/NIS2/relazione.docx
+
+Path resolution starts from the configured Google folder ID and walks child
+folders. If two items in the same parent have the same name, the logical path
+is ambiguous and the operation is rejected rather than guessed.
+
+
+drive_list
+----------
+List an authorized Drive folder.
+
+  drive_list(chat="mymcp", path="garr/NIS2", recursive=false)
+
+Returns logical paths, type, MIME type, size where available, Drive version,
+modified time and authorization mode. recursive defaults to false.
+
+
+drive_stat
+----------
+Return metadata for one authorized Drive item.
+
+  drive_stat(chat="mymcp", path="garr/NIS2/relazione.docx")
+
+The returned version can be passed as expected_version to write, rename or
+delete operations for optimistic concurrency protection.
+
+
+drive_read_blob
+---------------
+Read an ordinary binary Drive file as a base64 chunk.
+
+  drive_read_blob(chat="mymcp", path="garr/NIS2/relazione.docx",
+                  offset=0, length=1048576)
+
+Maximum chunk length is 1 MiB. Returned metadata includes size, version and eof.
+Google-native Docs/Sheets/Slides are intentionally not exported by this tool;
+the interface is intended for ordinary stored files such as DOCX and PDF.
+
+
+drive_write_blob
+----------------
+Replace an existing ordinary Drive file or create a new one using one or more
+base64 chunks.
+
+One-chunk example:
+
+  drive_write_blob(chat="mymcp", path="garr/NIS2/relazione.docx",
+                   offset=0, data_base64="...", truncate=true,
+                   commit=true, expected_version="123")
+
+Multi-chunk example:
+
+  drive_write_blob(... offset=0,       truncate=true, commit=false)
+  drive_write_blob(... offset=1048576, truncate=false, commit=false)
+  drive_write_blob(... offset=2097152, truncate=false, commit=true)
+
+A replacement session always starts with truncate=true and offset=0. Each
+decoded chunk is limited to 1 MiB. commit defaults to true.
+
+The server captures the target Drive file ID/version at the start of staging
+and checks them again immediately before commit. If another writer changed the
+file, or created a previously absent target, commit fails and keeps the staged
+data instead of overwriting the newer Drive state. expected_version is optional
+but, when supplied, must match before staging starts.
+
+Temporary staged data is held below /home/tools/mcp/drive-stage and is not
+visible through normal work-tree file tools.
+
+
+drive_mkdir
+-----------
+Create a folder under an rw alias.
+
+  drive_mkdir(chat="mymcp", path="garr/NIS2/new-folder")
+
+Creating an already existing item is rejected.
+
+
+drive_rename
+------------
+Rename an item without moving it to another parent.
+
+  drive_rename(chat="mymcp", path="garr/NIS2/old.docx",
+               new_name="new.docx", expected_version="123")
+
+Renaming a configured root alias itself is prohibited. A sibling with the new
+name causes the operation to fail.
+
+
+drive_delete
+------------
+Move an item to Google Drive trash.
+
+  drive_delete(chat="mymcp", path="garr/NIS2/old.docx",
+               expected_version="123")
+
+This is not permanent deletion. Deleting a configured root alias is prohibited.
+All Drive modifications are rejected for ro aliases.
+
+
+SHELL TOOLS
+===========
+
+run
+---
+Run a shell command synchronously as Unix user mcp.
+
+  run(chat="mymcp", command="make", cwd="project")
+
+cwd defaults to . relative to /home/tools/mcp/work and must stay inside that
+root. Current timeout is 60 seconds. The command itself runs through /bin/sh -c
+with the normal Unix permissions of account mcp; cwd restriction is not a full
+filesystem sandbox.
+
+Use run for short commands only. Do not use sleep-based polling unless the owner
+has explicitly authorized that technique for the current task.
+
+
+start
+-----
+Start a long-running command asynchronously.
+
+  start(chat="mymcp", command="./program", cwd="project")
+
+Returns a job_id. Use status/tail later rather than delayed polling through run.
+
+
+status
+------
+Inspect a job owned by the same chat.
+
+  status(chat="mymcp", job_id="job_...")
+
+Returns state, process identifiers, elapsed time, exit code when available, CPU,
+RSS, command, cwd and output paths.
+
+
+tail
+----
+Read the last lines of a job's stdout, stderr or both.
+
+  tail(chat="mymcp", job_id="job_...", lines=50, stream="both")
+
+Allowed stream values: stdout, stderr, both. Maximum lines: 1000.
+
+
+stop
+----
+Stop a job owned by the same chat.
+
+  stop(chat="mymcp", job_id="job_...", force=false)
+
+force=false sends SIGTERM; force=true sends SIGKILL.
+
+
+jobs
+----
+List jobs owned by the requesting chat, newest first.
+
+  jobs(chat="mymcp", limit=100)
+
+Maximum limit: 1000.
+
+
+REMOTE AGENT TOOL
+=================
+
+agent_call
+----------
+Send a typed request to an authorized remote agent and wait for its result.
+
+  agent_call(chat="mymcp", agent="mac1", module="test",
+             action="echo", payload={...}, timeout=30)
+
+agent is optional when exactly one suitable configured agent can handle the
+module. timeout maximum is 300 seconds. Agent configuration is read dynamically
+from /home/tools/mcp/agent.conf. Browser cookies and local authentication state
+remain on the agent machine unless a specific module deliberately returns data.
+
+
+AUDIT LOG
+=========
+
+Operational requests are logged to:
+
+  /home/tools/mcp/mcp.log
+
+The audit log includes chat, client, tool name, elapsed time and selected
+operational arguments. It deliberately does not log text/blob contents,
+stdout/stderr, or complete JSON payloads.
+
+Drive audit fields include logical paths and operation metadata only:
+
+  drive_list       path, recursive, tool_error
+  drive_stat       path, tool_error
+  drive_read_blob  path, offset, length, tool_error
+  drive_write_blob path, offset, base64_chars, truncate, commit, tool_error
+  drive_mkdir      path, tool_error
+  drive_rename     path, new_name, tool_error
+  drive_delete     path, tool_error
+
+expected_version values and OAuth tokens are not written to the tool-detail log.
+
+
+DEVELOPMENT / TESTING
+=====================
+
+Development directory:
+
+  /home/tools/mcp/work/mymcp
+
+Build:
+
+  make clean
+  make
+
+The server now links cJSON and libcurl. mcp_agent also links cJSON and libcurl.
+Builds must complete with zero compiler warnings.
+
+The permanent regression test starts a separate mymcp on port 18080 and a local
+mock Google Drive API on port 18081. It exercises all Drive operations without
+accessing the real Google account.
+
+The agent test still needs an isolated agent.conf and agent spool. See
+mymcp/README.md for the exact command.
+
+Production deployment is not automatic. Do not replace /home/tools/mcp/mymcp
+or restart mcp.service unless the owner explicitly requests deployment.

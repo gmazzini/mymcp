@@ -2,7 +2,7 @@
 
 ## Project status
 
-Current development version: **1.09**
+Current development version: **1.10**
 
 `mymcp` is a small MCP server written in C and designed to replace the previous Python MCP server that used the official Python MCP SDK.
 
@@ -79,13 +79,14 @@ The source follows the user's C style rules.
 - Optimize for performance and avoid unnecessary allocations or variables.
 - Do not leave dead code or unused variables.
 - Opening braces are on the same line as the statement, with one space before `{`.
+- Never create or use hidden files or directories (a basename starting with `.`) for source, configuration, cache, state, temporary data or backups. Use explicit visible names instead; project temporary/generated data belongs under `tmpdata/`.
 - Source header format is:
 
 ```c
-// Gianluca Mazzini @2026- Version 1.09
+// Gianluca Mazzini @2026- Version 1.10
 ```
 
-The initial development year and major version are user-controlled. Version 1.09 is the current implemented and tested development version.
+The initial development year and major version are user-controlled. Version 1.10 is the current implemented and tested development version.
 
 
 ## Dependencies
@@ -404,11 +405,30 @@ archive 1Qwerty... ro
 
 Only paths below the configured folder IDs can be reached through Drive tools. The alias is the first path component, for example `garr/NIS2/relazione.docx`. Duplicate names inside one Drive folder make a path ambiguous and are rejected rather than guessed.
 
-The OAuth access token is read from:
+Google access tokens are obtained on demand from the central authentication service:
 
 ```text
-/home/www/data/google_access_token
+POST https://google.mazzini.org/googleauth
+Content-Type: application/x-www-form-urlencoded
+
+action=token&channel=mymcp&key=<API_KEY>
 ```
+
+The HTTP 200 response body is the Google access token in `text/plain`; `mymcp` uses it only to build the existing `Authorization: Bearer <token>` header for Google Drive requests. OAuth login, refresh tokens and access-token renewal remain entirely the responsibility of `googleauth`. `mymcp` never reads `/home/www/data/google_access_token`.
+
+The channel API key is runtime-only configuration in:
+
+```text
+/home/tools/mcp/mymcp.conf
+```
+
+with:
+
+```text
+googleauth_key=<API_KEY>
+```
+
+The file should be readable by the `mcp` service account and not by unrelated users; the recommended ownership/mode is `root:mcp` and `0640`. The API key and returned access token are never written to the MCP audit log. The `mymcp` channel name is fixed and non-secret.
 
 Binary write sessions use private staging outside the normal work tree:
 
@@ -424,7 +444,7 @@ Production setup must create that directory as `mcp:mcp` mode `0700`. The stagin
 
 `drive_mkdir(path)` creates a folder under an `rw` alias. `drive_rename(path,new_name,expected_version?)` changes only the item's name, not its parent. `drive_delete(path,expected_version?)` moves the item to Google Drive trash; it does not permanently delete it. Rename and delete of a configured root alias are prohibited. All modifying operations are rejected on `ro` aliases.
 
-For tests, the Drive map, token, staging directory and API endpoints can be overridden with `MYMCP_DRIVE_MAP`, `MYMCP_DRIVE_TOKEN`, `MYMCP_DRIVE_STAGE`, `MYMCP_DRIVE_API` and `MYMCP_DRIVE_UPLOAD_API`. The regression suite uses these overrides only against its local mock server.
+For tests, the Drive map, googleauth configuration path, googleauth endpoint, staging directory and Drive API endpoints can be overridden with `MYMCP_DRIVE_MAP`, `MYMCP_GOOGLEAUTH_CONFIG`, `MYMCP_GOOGLEAUTH_URL`, `MYMCP_GOOGLEAUTH_CHANNEL`, `MYMCP_DRIVE_STAGE`, `MYMCP_DRIVE_API` and `MYMCP_DRIVE_UPLOAD_API`. The regression suite uses these overrides only against its local mock servers.
 
 
 ### run
@@ -821,7 +841,7 @@ Normal mode runs continuously. Diagnostic one-request mode is:
 
 `--once` means one **completed request**, not one long-poll cycle: idle long-poll expirations simply cause another `wait`; the process exits only after it has received, executed and returned one request.
 
-The current Version 1.09 development server passes the full regression suite on a separate local port, including the end-to-end fake-agent exchange (`agent_call -> wait -> result`), wrong agent authentication and unavailable modules.
+The current Version 1.10 development server passes the full regression suite on a separate local port, including the end-to-end fake-agent exchange (`agent_call -> wait -> result`), wrong agent authentication and unavailable modules.
 
 
 ## mcp_watch
@@ -934,11 +954,11 @@ A stricter sandbox for `run/start` was discussed but intentionally not implement
 At the time this document was written:
 
 - The C implementation is stable and in production.
-- Production `mymcp` is Version 1.08. Development Version 1.09 adds the native Google Drive backend and has not been deployed by this development step. Production `mcp_agent` on the remote Mac is Version 1.33. The agent provides the established `test/echo`, `browser/read_tab` and `qrz/webcontact.add` functions plus `edistribuzione/load_profile.month`; the E-Distribuzione result includes the POD, and `mymcp` stores successful monthly profiles in `mymcp/tmpdata/<POD>_YYYY_MM.csv`. Existing agent functions remain unchanged in behavior.
+- Production `mymcp` is Version 1.10, using the central `googleauth` channel for Google Drive access-token acquisition. Production `mcp_agent` on the remote Mac is Version 1.33. The agent provides the established `test/echo`, `browser/read_tab` and `qrz/webcontact.add` functions plus `edistribuzione/load_profile.month`; the E-Distribuzione result includes the POD, and `mymcp` stores successful monthly profiles in `mymcp/tmpdata/<POD>_YYYY_MM.csv`. Existing agent functions remain unchanged in behavior.
 - The production service executes `/home/tools/mcp/mymcp`.
 - The Python MCP virtualenv, Python SDK checkout, old `server.py` and related MCP Python runtime files were removed.
 - The C binary uses cJSON, libcurl and libc.
-- Production 1.08 exposes the pre-Drive toolset. Development 1.09 exposes 20 MCP tools, including seven native Drive tools and `agent_call`.
+- Production 1.10 exposes 20 MCP tools, including seven native Drive tools and `agent_call`; the tool behavior is unchanged apart from Drive token acquisition through `googleauth`.
 - `chat` is mandatory.
 - Job ownership by chat works.
 - Request logging is enabled at `/home/tools/mcp/mcp.log` with operational audit fields that do not log file contents or command output.
@@ -968,3 +988,4 @@ At the time this document was written:
 18. Do not remove or alter unrelated project files under `work/`.
 19. If ChatGPT shows stale tools, verify the server directly before modifying code.
 20. For this conversation/project, use `chat="mymcp"` when calling tools.
+21. Never create or use hidden files or directories (names beginning with `.`); use visible names instead, including for caches, state, temporary files and backups.

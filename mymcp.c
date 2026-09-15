@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 1.09
+// Gianluca Mazzini @2026- Version 1.10
 
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
@@ -24,7 +24,7 @@
 #include <unistd.h>
 
 #define SERVER_NAME "mymcp"
-#define SERVER_VERSION "1.09"
+#define SERVER_VERSION "1.10"
 #define PROTOCOL_VERSION "2026-07-28"
 #define WORK_DIR "/home/tools/mcp/work"
 #ifndef JOBS_DIR

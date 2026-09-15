@@ -1,0 +1,347 @@
+chrome_check for macOS
+=====================
+
+Purpose
+-------
+
+chrome_check is a small C helper that controls a dedicated Google Chrome instance through the Chrome DevTools Protocol (CDP).
+
+Its default behavior is:
+
+  1. connect to Chrome remote debugging on http://127.0.0.1:9222
+  2. find exactly one ChatGPT tab whose title matches or contains "mymcp"
+  3. verify that the ChatGPT composer is empty and usable
+  4. insert the text "check"
+  5. send Enter
+
+This was tested successfully on macOS with Google Chrome and a dedicated Chrome profile.
+
+Source
+------
+
+Development source on the MCP server:
+
+  /home/tools/mcp/work/mymcp/chrome_check.c
+
+Development binary on the MCP server:
+
+  /home/tools/mcp/work/mymcp/chrome_check
+
+On the Mac, copy chrome_check.c into a working directory such as Downloads before compiling.
+
+Dependencies on macOS
+---------------------
+
+Install Homebrew packages:
+
+  brew install cjson curl pkgconf
+
+The Homebrew version of curl is required because the Apple/system libcurl may not include WebSocket protocols ws/wss.
+
+Verify the Homebrew curl build:
+
+  $(brew --prefix curl)/bin/curl --version
+
+The Protocols line must include:
+
+  ws wss
+
+Example of a suitable result:
+
+  Protocols: ... http https ... ws wss
+
+Do not rely on the system curl shown by:
+
+  curl --version
+
+On the tested Mac, the system curl did not include ws/wss support and caused:
+
+  Chrome WebSocket error: Unsupported protocol
+
+Compile on macOS
+----------------
+
+Use Homebrew cJSON and Homebrew libcurl explicitly:
+
+  PKG_CONFIG_PATH="$(brew --prefix curl)/lib/pkgconfig:$(brew --prefix cjson)/lib/pkgconfig" \
+  gcc -o chrome_check chrome_check.c \
+  $(PKG_CONFIG_PATH="$(brew --prefix curl)/lib/pkgconfig:$(brew --prefix cjson)/lib/pkgconfig" pkg-config --cflags --libs libcjson libcurl)
+
+If gcc returns to the shell prompt without errors, the helper has compiled.
+
+Verify the executable exists:
+
+  ls -l chrome_check
+
+Verify which libcurl it is linked against:
+
+  otool -L chrome_check | grep curl
+
+The linked library should be the Homebrew curl installation, not the Apple/system libcurl.
+
+Chrome setup
+------------
+
+Use a dedicated Chrome profile for remote debugging.
+
+This is important because Chrome remote debugging has powerful access to the browser session. The dedicated profile keeps the helper separate from the normal Chrome profile containing personal browsing data, cookies and saved passwords.
+
+Start the dedicated Chrome instance from Terminal:
+
+  /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    --remote-debugging-port=9222 \
+    --user-data-dir="$HOME/chrome-mcp-profile"
+
+Recommended security rules for this profile:
+
+  - do not enable Chrome/Google Sync
+  - do not import passwords
+  - do not save unrelated passwords
+  - use it only for ChatGPT automation
+  - log in only to the ChatGPT account needed for the watcher
+
+The directory:
+
+  $HOME/chrome-mcp-profile
+
+is separate from the normal Chrome user data directory.
+
+Prepare the ChatGPT tab
+-----------------------
+
+In the dedicated Chrome window:
+
+  1. log in to ChatGPT
+  2. open the ChatGPT conversation to be controlled
+  3. make sure the tab title contains the expected name, by default "mymcp"
+  4. leave that tab open
+
+Before running chrome_check, verify that Chrome remote debugging is reachable:
+
+  curl http://127.0.0.1:9222/json/list
+
+The result should be JSON containing Chrome tabs with fields such as:
+
+  title
+  url
+  webSocketDebuggerUrl
+
+Basic use
+---------
+
+Run:
+
+  ./chrome_check
+
+Defaults are:
+
+  tab title:  mymcp
+  text:       check
+  CDP URL:    http://127.0.0.1:9222
+
+A successful run looks similar to:
+
+  tab: mymcp
+  url: https://chatgpt.com/c/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  OK: sent 'check' to tab 'mymcp'
+
+The ChatGPT browser tab should receive:
+
+  check
+
+followed by Enter, exactly as if it had been typed manually.
+
+Command-line arguments
+----------------------
+
+Current syntax:
+
+  ./chrome_check [tab-title] [text] [debug-url]
+
+Examples:
+
+Send the default text "check" to a tab matching dts02:
+
+  ./chrome_check dts02
+
+Send another text:
+
+  ./chrome_check dts02 "check"
+
+Use another debugging endpoint:
+
+  ./chrome_check dts02 "check" http://127.0.0.1:9223
+
+Safety behavior
+---------------
+
+chrome_check is intentionally conservative.
+
+It only accepts Chrome pages whose URL belongs to chatgpt.com.
+
+It first tries an exact case-insensitive title match. If none exists, it falls back to a case-insensitive substring match.
+
+It refuses to operate if:
+
+  - no matching ChatGPT tab exists
+  - more than one matching ChatGPT tab exists
+  - the ChatGPT composer cannot be found
+  - the composer is disabled
+  - the composer already contains text
+  - the composer cannot be focused
+  - the CDP WebSocket connection fails
+
+This prevents accidental insertion into an unrelated tab or overwriting an unfinished user draft.
+
+How it works
+------------
+
+The helper does not use mouse coordinates, AppleScript or screen automation.
+
+It uses Chrome DevTools Protocol:
+
+  GET /json/list
+
+is used to discover open tabs and obtain the selected tab's:
+
+  webSocketDebuggerUrl
+
+The helper then opens that WebSocket and uses CDP methods including:
+
+  Runtime.evaluate
+  Input.insertText
+  Input.dispatchKeyEvent
+
+Runtime.evaluate locates and focuses the ChatGPT composer.
+
+Input.insertText inserts the text.
+
+Input.dispatchKeyEvent sends Enter.
+
+Troubleshooting
+---------------
+
+1. Error:
+
+     HTTP error: Could not connect to server
+
+   Cause:
+
+     Chrome was not started with remote debugging, or port 9222 is not reachable.
+
+   Check:
+
+     curl http://127.0.0.1:9222/json/list
+
+
+2. Error:
+
+     Chrome WebSocket error: Unsupported protocol
+
+   Cause:
+
+     chrome_check was linked against a libcurl build without ws/wss support.
+
+   Check system curl:
+
+     curl --version
+
+   Check Homebrew curl:
+
+     $(brew --prefix curl)/bin/curl --version
+
+   The Homebrew result must include:
+
+     ws wss
+
+   Recompile with the explicit PKG_CONFIG_PATH command documented above.
+
+
+3. Error:
+
+     No ChatGPT tab matching 'mymcp'
+
+   Cause:
+
+     no open chatgpt.com tab has a title matching the requested name.
+
+   Check:
+
+     curl http://127.0.0.1:9222/json/list
+
+   and inspect the title field.
+
+
+4. Error similar to:
+
+     Refusing: 2 ChatGPT tabs match 'mymcp'
+
+   Cause:
+
+     the match is ambiguous.
+
+   Close one tab or use a more specific tab-title argument.
+
+
+5. Error:
+
+     Composer not ready: BUSY
+
+   Cause:
+
+     there is already text in the ChatGPT composer.
+
+   The helper intentionally refuses to replace it.
+
+
+6. The program prints:
+
+     tab: mymcp
+     url: https://chatgpt.com/...
+
+   but does not print:
+
+     OK: sent ...
+
+   This means tab discovery worked but a later CDP/WebSocket/composer step failed. Read the stderr message that follows.
+
+Successful macOS test
+---------------------
+
+The helper was successfully tested end-to-end on macOS:
+
+  - Chrome remote debugging was enabled on port 9222
+  - a dedicated Chrome profile was used
+  - the ChatGPT tab title was "mymcp"
+  - chrome_check discovered the correct URL
+  - it inserted "check"
+  - it sent Enter
+  - the ChatGPT conversation received the message correctly
+
+Operational idea
+----------------
+
+The intended future use is as the browser-side part of an external watcher.
+
+A possible architecture is:
+
+  long-running MCP jobs
+        |
+        v
+  server-side watcher detects an interesting event
+        |
+        v
+  Mac watcher receives/polls the event
+        |
+        v
+  chrome_check sends "check" to the correct ChatGPT tab
+        |
+        v
+  Codex/Work wakes only when there is something worth checking
+
+This avoids repeated Codex/Work polling while external jobs are running.
+
+Current status
+--------------
+
+chrome_check is currently a standalone experimental helper. It is not part of the mymcp server protocol and is not installed as a production service.
