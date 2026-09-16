@@ -765,6 +765,19 @@ stop(chat="project",job_id="job_...",force=false)
 Use `force=true` only when necessary.
 
 
+## gmcp client
+
+Current `gmcp` version: **1.02**.
+
+`gmcp` is the command-line client for the MCP service. Its `github` command reads `/home/tools/mcp/work/github.map` and treats that mapping as the complete authoritative file list for every repository named in the map.
+
+For each mapped repository, `gmcp github` clones the current repository into its disposable local clone, compares the tracked Git paths with the destinations listed in `github.map`, stages deletion of every tracked GitHub file that is not mapped, then creates or updates the mapped files from MCP. One commit and push is produced only when the repository has changes. Deleted paths are printed as `DELETE owner/repo/path`.
+
+The deletion step operates only inside the temporary Git clone and therefore only affects the Git repository after the resulting commit is pushed. It never removes a source file from `/home/tools/mcp/work`, never removes `github.map`, and never removes runtime data from the MCP server. Only paths returned by `git ls-files` are candidates for GitHub deletion; `.git` metadata and unrelated local files are not candidates.
+
+Consequently, any file that must remain in a mapped GitHub repository, including documentation, examples or repository metadata files, must itself appear as a destination in `github.map`.
+
+
 ## Remote agents
 
 `mymcp` provides a generic request/response transport to remote local agents. The current Mac agent can use a dedicated Chrome instance through CDP on `127.0.0.1:9222`, while the transport itself remains independent of browser-specific modules.

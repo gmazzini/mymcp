@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 1.01
+// Gianluca Mazzini @2026- Version 1.02
 #include <cjson/cJSON.h>
 #include <curl/curl.h>
 #include <ctype.h>
@@ -13,7 +13,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define GMCP_VERSION "1.01"
+#define GMCP_VERSION "1.02"
 #define DEFAULT_URL "https://www.mazzini.org/mcp"
 #define PROTOCOL_VERSION "2026-07-28"
 #define CLIENT_NAME "gmcp"
@@ -1042,6 +1042,134 @@ static int github_repo_processed(struct GithubEntry *entries,int index) {
   return 0;
 }
 
+static int github_repo_has_destination(struct GithubEntry *entries,int count,int index,const char *path) {
+  int i;
+
+  for(i=0;i<count;i++) {
+    if(strcmp(entries[i].owner,entries[index].owner)!=0 || strcmp(entries[i].repo,entries[index].repo)!=0) continue;
+    if(strcmp(entries[i].dest,path)==0) return 1;
+  }
+  return 0;
+}
+
+static int git_ls_files(const char *dir,char **data_out,size_t *len_out) {
+  char *argv[6],*data,*tmp;
+  unsigned char buf[4096];
+  size_t len,capacity,needed,new_capacity;
+  ssize_t nr;
+  pid_t pid;
+  int fd[2],status,read_error;
+
+  *data_out=NULL;
+  *len_out=0;
+  if(pipe(fd)!=0) return -1;
+  pid=fork();
+  if(pid<0) {
+    close(fd[0]);
+    close(fd[1]);
+    return -1;
+  }
+  if(pid==0) {
+    close(fd[0]);
+    if(dup2(fd[1],STDOUT_FILENO)<0) _exit(127);
+    close(fd[1]);
+    argv[0]="git"; argv[1]="-C"; argv[2]=(char *)dir; argv[3]="ls-files"; argv[4]="-z"; argv[5]=NULL;
+    execvp(argv[0],argv);
+    _exit(127);
+  }
+  close(fd[1]);
+  data=NULL;
+  len=0;
+  capacity=0;
+  read_error=0;
+  for(;;) {
+    nr=read(fd[0],buf,sizeof(buf));
+    if(nr<0) {
+      if(errno==EINTR) continue;
+      read_error=1;
+      break;
+    }
+    if(nr==0) break;
+    needed=len+(size_t)nr+1;
+    if(needed<len) {
+      read_error=1;
+      break;
+    }
+    if(needed>capacity) {
+      new_capacity=capacity==0?4096:capacity;
+      for(;new_capacity<needed;) {
+        if(new_capacity>((size_t)-1)/2) {
+          new_capacity=needed;
+          break;
+        }
+        new_capacity*=2;
+      }
+      tmp=(char *)realloc(data,new_capacity);
+      if(tmp==NULL) {
+        read_error=1;
+        break;
+      }
+      data=tmp;
+      capacity=new_capacity;
+    }
+    memcpy(data+len,buf,(size_t)nr);
+    len+=(size_t)nr;
+  }
+  close(fd[0]);
+  if(waitpid(pid,&status,0)<0) {
+    free(data);
+    return -1;
+  }
+  if(read_error || !WIFEXITED(status) || WEXITSTATUS(status)!=0) {
+    free(data);
+    return -1;
+  }
+  if(data==NULL) {
+    data=(char *)malloc(1);
+    if(data==NULL) return -1;
+  }
+  data[len]=0;
+  *data_out=data;
+  *len_out=len;
+  return 0;
+}
+
+static int remove_unmapped_github_files(struct GithubEntry *entries,int count,int index,const char *dir) {
+  char *data,*path,*end;
+  char *rm_argv[8],*clean_argv[7];
+  size_t len;
+  int deleted;
+
+  if(git_ls_files(dir,&data,&len)!=0) {
+    fprintf(stderr,"git ls-files failed: %s/%s\n",entries[index].owner,entries[index].repo);
+    return -1;
+  }
+  deleted=0;
+  path=data;
+  end=data+len;
+  for(;path<end;path+=strlen(path)+1) {
+    if(github_repo_has_destination(entries,count,index,path)) continue;
+    printf("DELETE %s/%s/%s\n",entries[index].owner,entries[index].repo,path);
+    fflush(stdout);
+    rm_argv[0]="git"; rm_argv[1]="-C"; rm_argv[2]=(char *)dir; rm_argv[3]="rm"; rm_argv[4]="-q"; rm_argv[5]="--"; rm_argv[6]=path; rm_argv[7]=NULL;
+    if(run_program(rm_argv)!=0) {
+      fprintf(stderr,"git rm failed: %s/%s/%s\n",entries[index].owner,entries[index].repo,path);
+      free(data);
+      return -1;
+    }
+    deleted++;
+  }
+  free(data);
+  if(deleted>0) {
+    clean_argv[0]="git"; clean_argv[1]="-C"; clean_argv[2]=(char *)dir; clean_argv[3]="clean"; clean_argv[4]="-fdq"; clean_argv[5]=NULL; clean_argv[6]=NULL;
+    if(run_program(clean_argv)!=0) {
+      fprintf(stderr,"git clean failed: %s/%s\n",entries[index].owner,entries[index].repo);
+      return -1;
+    }
+  }
+  return deleted;
+}
+
 static int process_github_repo(const char *chat,struct GithubEntry *entries,int count,int index,int repo_number) {
   char clone_url[512],dir[PATH_MAX],local[PATH_MAX];
   char *clone_argv[8],*add_argv[7],*commit_argv[7],*push_argv[7];
@@ -1064,7 +1192,11 @@ static int process_github_repo(const char *chat,struct GithubEntry *entries,int 
     remove_tree(dir);
     return -1;
   }
-  changed=0;
+  changed=remove_unmapped_github_files(entries,count,index,dir);
+  if(changed<0) {
+    remove_tree(dir);
+    return -1;
+  }
   rc=0;
   for(i=0;i<count;i++) {
     if(strcmp(entries[i].owner,entries[index].owner)!=0 || strcmp(entries[i].repo,entries[index].repo)!=0) continue;
@@ -1574,7 +1706,7 @@ static void usage(const char *prog) {
   printf("usage: %s [-c chat] command ...\n\n",prog);
   printf("  hello\n");
   printf("  projects\n");
-  printf("  github\n");
+  printf("  github                 synchronize GitHub exactly to github.map\n");
   printf("  ls <project> [path]\n");
   printf("  pull <project>\n");
   printf("  get <project> <path>\n");
