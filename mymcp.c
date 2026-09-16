@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 1.10
+// Gianluca Mazzini @2026- Version 1.11
 
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
@@ -24,7 +24,7 @@
 #include <unistd.h>
 
 #define SERVER_NAME "mymcp"
-#define SERVER_VERSION "1.10"
+#define SERVER_VERSION "1.11"
 #define PROTOCOL_VERSION "2026-07-28"
 #define WORK_DIR "/home/tools/mcp/work"
 #ifndef JOBS_DIR
@@ -1343,6 +1343,21 @@ static cJSON *build_tools(void) {
   require_field(tool,"path");
   cJSON_AddItemToArray(tools,tool);
 
+  tool=new_tool("drive_get_file","Download an authorized ordinary Google Drive file directly into the calling chat workspace without base64 transfer through the client.");
+  add_property(tool,"path",schema_string());
+  add_property(tool,"local_path",schema_string());
+  require_field(tool,"path");
+  require_field(tool,"local_path");
+  cJSON_AddItemToArray(tools,tool);
+
+  tool=new_tool("drive_put_file","Upload a local file from the calling chat workspace directly to an authorized writable Google Drive path without base64 transfer through the client.");
+  add_property(tool,"local_path",schema_string());
+  add_property(tool,"path",schema_string());
+  add_property(tool,"expected_version",schema_string());
+  require_field(tool,"local_path");
+  require_field(tool,"path");
+  cJSON_AddItemToArray(tools,tool);
+
   tool=new_tool("drive_write_blob","Stage and optionally commit a binary chunk to an authorized writable Google Drive file. Start a replacement with truncate=true; use commit=false until the final chunk.");
   add_property(tool,"path",schema_string());
   s=schema_integer(0,1);
@@ -1603,6 +1618,12 @@ static void build_tool_log_detail(const char *name,cJSON *args,cJSON *result,
     get_string_arg(args,"path",&path,0);
     log_quote_value(path,q1,sizeof(q1));
     snprintf(out,out_size,"path=%s tool_error=%s",q1,is_error?"true":"false");
+  } else if(strcmp(name,"drive_get_file")==0 || strcmp(name,"drive_put_file")==0) {
+    get_string_arg(args,"path",&path,0);
+    get_string_arg(args,"local_path",&command,0);
+    log_quote_value(path,q1,sizeof(q1));
+    log_quote_value(command,q2,sizeof(q2));
+    snprintf(out,out_size,"path=%s local_path=%s tool_error=%s",q1,q2,is_error?"true":"false");
   } else if(strcmp(name,"drive_read_blob")==0) {
     get_string_arg(args,"path",&path,0);
     get_long_arg(args,"offset",&offset,0);
@@ -1910,6 +1931,62 @@ static cJSON *tool_drive_read_blob(cJSON *args) {
   if(get_int_arg(args,"length",&length,MAX_BLOB_CHUNK)<0 || length<1 || length>MAX_BLOB_CHUNK) return tool_result_string("invalid argument: length out of range",1);
   data=NULL;
   if(!mcp_drive_read_blob(path,offset,length,&data,error,sizeof(error))) return tool_result_string(error,1);
+  return tool_result_json(data,0);
+}
+
+static int chat_local_write_path(const char *chat,const char *local_path,char *relative,size_t relative_size,char *full,size_t full_size) {
+  int n;
+
+  if(chat==NULL || local_path==NULL || local_path[0]==0 || local_path[0]=='/') return -1;
+  n=snprintf(relative,relative_size,"%s/%s",chat,local_path);
+  if(n<0 || (size_t)n>=relative_size) return -1;
+  return ensure_write_path(relative,full,full_size);
+}
+
+static int chat_local_existing_path(const char *chat,const char *local_path,char *relative,size_t relative_size,char *full,size_t full_size) {
+  int n;
+
+  if(chat==NULL || local_path==NULL || local_path[0]==0 || local_path[0]=='/') return -1;
+  n=snprintf(relative,relative_size,"%s/%s",chat,local_path);
+  if(n<0 || (size_t)n>=relative_size) return -1;
+  return safe_existing_path(relative,full,full_size,0);
+}
+
+static cJSON *tool_drive_get_file(cJSON *args) {
+  const char *chat,*path,*local_path;
+  cJSON *data;
+  char relative[PATH_MAX],full[PATH_MAX],error[512];
+
+  chat=NULL;
+  path=NULL;
+  local_path=NULL;
+  if(get_string_arg(args,"chat",&chat,1)<0 || get_string_arg(args,"path",&path,1)<0 || get_string_arg(args,"local_path",&local_path,1)<0)
+    return tool_result_string("invalid arguments: path and local_path are required strings",1);
+  if(chat_local_write_path(chat,local_path,relative,sizeof(relative),full,sizeof(full))!=0)
+    return tool_result_string("local_path outside chat workspace or invalid path",1);
+  data=NULL;
+  if(!mcp_drive_get_file(path,full,&data,error,sizeof(error))) return tool_result_string(error,1);
+  cJSON_AddStringToObject(data,"local_path",local_path);
+  return tool_result_json(data,0);
+}
+
+static cJSON *tool_drive_put_file(cJSON *args) {
+  const char *chat,*path,*local_path,*expected_version;
+  cJSON *data;
+  char relative[PATH_MAX],full[PATH_MAX],error[512];
+
+  chat=NULL;
+  path=NULL;
+  local_path=NULL;
+  expected_version=NULL;
+  if(get_string_arg(args,"chat",&chat,1)<0 || get_string_arg(args,"path",&path,1)<0 || get_string_arg(args,"local_path",&local_path,1)<0)
+    return tool_result_string("invalid arguments: local_path and path are required strings",1);
+  if(get_string_arg(args,"expected_version",&expected_version,0)<0) return tool_result_string("invalid argument: expected_version must be a string",1);
+  if(chat_local_existing_path(chat,local_path,relative,sizeof(relative),full,sizeof(full))!=0)
+    return tool_result_string("local_path outside chat workspace, invalid, or not a regular file",1);
+  data=NULL;
+  if(!mcp_drive_put_file(path,full,expected_version,&data,error,sizeof(error))) return tool_result_string(error,1);
+  cJSON_AddStringToObject(data,"local_path",local_path);
   return tool_result_json(data,0);
 }
 
@@ -2819,6 +2896,8 @@ static cJSON *dispatch_tool(const char *name,cJSON *args) {
   if(strcmp(name,"drive_list")==0) return tool_drive_list(args);
   if(strcmp(name,"drive_stat")==0) return tool_drive_stat(args);
   if(strcmp(name,"drive_read_blob")==0) return tool_drive_read_blob(args);
+  if(strcmp(name,"drive_get_file")==0) return tool_drive_get_file(args);
+  if(strcmp(name,"drive_put_file")==0) return tool_drive_put_file(args);
   if(strcmp(name,"drive_write_blob")==0) return tool_drive_write_blob(args);
   if(strcmp(name,"drive_mkdir")==0) return tool_drive_mkdir(args);
   if(strcmp(name,"drive_rename")==0) return tool_drive_rename(args);

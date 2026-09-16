@@ -83,10 +83,10 @@ The source follows the user's C style rules.
 - Source header format is:
 
 ```c
-// Gianluca Mazzini @2026- Version 1.10
+// Gianluca Mazzini @2026- Version 1.11
 ```
 
-The initial development year and major version are user-controlled. Version 1.10 is the current implemented and tested development version.
+The initial development year and major version are user-controlled. Version 1.11 is the current implemented and tested development version.
 
 
 ## Dependencies
@@ -244,7 +244,7 @@ The response form mirrors the prior working server and includes both text `conte
 
 ## Available tools
 
-The development server exposes 20 tools:
+The development server exposes 22 tools:
 
 ```text
 hello
@@ -256,6 +256,8 @@ write_blob
 drive_list
 drive_stat
 drive_read_blob
+drive_get_file
+drive_put_file
 drive_write_blob
 drive_mkdir
 drive_rename
@@ -438,7 +440,11 @@ Binary write sessions use private staging outside the normal work tree:
 
 Production setup must create that directory as `mcp:mcp` mode `0700`. The staging area is not exposed by the normal work-directory tools.
 
-`drive_list(path,recursive=false)` lists an authorized folder. `drive_stat(path)` returns item metadata including the Drive `version`, which can be used for optimistic concurrency checks. `drive_read_blob(path,offset,length)` reads ordinary binary Drive files in base64 chunks. Google-native Docs/Sheets/Slides are deliberately not exported by this interface; the current target is ordinary files such as `.docx` and `.pdf` stored in Drive.
+`drive_list(path,recursive=false)` lists an authorized folder. `drive_stat(path)` returns item metadata including the Drive `version`, which can be used for optimistic concurrency checks. `drive_read_blob(path,offset,length)` reads ordinary binary Drive files in base64 chunks. Google-native Docs/Sheets/Slides are deliberately not exported by this interface; the current target is ordinary files such as `.pptx`, `.docx` and `.pdf` stored in Drive.
+
+`drive_get_file(path,local_path)` downloads an ordinary Drive file directly into `/home/tools/mcp/work/<chat>/<local_path>` without returning its bytes or base64 through the MCP client. The destination is restricted to the calling chat workspace; traversal and symlink escapes are rejected. Download uses a temporary file in the destination directory followed by an atomic rename, so an interrupted transfer does not leave a partial target. The result includes Drive metadata plus `id` and `local_path`.
+
+`drive_put_file(local_path,path,expected_version?)` uploads a regular file directly from `/home/tools/mcp/work/<chat>/<local_path>` to an authorized `rw` Drive destination without sending file bytes or base64 through the MCP client. The local source is restricted to the calling chat workspace. Existing Drive files retain the version check semantics used by the Drive write backend; `expected_version` can reject a stale replacement. The result includes Drive metadata plus `id`, `local_path` and `committed=true`.
 
 `drive_write_blob` replaces or creates an ordinary Drive file using chunks of at most 1 MiB. A write session starts with `truncate=true` and `offset=0`. For a one-chunk file, use `commit=true`. For a multi-chunk file, use `commit=false` for every non-final chunk and `commit=true` on the final chunk. The server captures the target Drive version when staging begins and checks it again before commit. If another writer changed or created the target in the meantime, commit fails and leaves the staged data available for a deliberate retry instead of overwriting the newer Drive file. Optional `expected_version` can enforce the version already observed by the caller before staging begins.
 
@@ -680,6 +686,8 @@ write_blob       path, offset, base64_chars, truncate, tool_error
 drive_list       path, recursive, tool_error
 drive_stat       path, tool_error
 drive_read_blob  path, offset, length, tool_error
+drive_get_file   path, local_path, tool_error
+drive_put_file   path, local_path, tool_error
 drive_write_blob path, offset, base64_chars, truncate, commit, tool_error
 drive_mkdir      path, tool_error
 drive_rename     path, new_name, tool_error
@@ -854,7 +862,7 @@ Normal mode runs continuously. Diagnostic one-request mode is:
 
 `--once` means one **completed request**, not one long-poll cycle: idle long-poll expirations simply cause another `wait`; the process exits only after it has received, executed and returned one request.
 
-The current Version 1.10 development server passes the full regression suite on a separate local port, including the end-to-end fake-agent exchange (`agent_call -> wait -> result`), wrong agent authentication and unavailable modules.
+The current Version 1.11 development server passes the full regression suite on a separate local port, including the end-to-end fake-agent exchange (`agent_call -> wait -> result`), wrong agent authentication and unavailable modules.
 
 
 ## mcp_watch
@@ -967,11 +975,11 @@ A stricter sandbox for `run/start` was discussed but intentionally not implement
 At the time this document was written:
 
 - The C implementation is stable and in production.
-- Production `mymcp` is Version 1.10, using the central `googleauth` channel for Google Drive access-token acquisition. Production `mcp_agent` on the remote Mac is Version 1.33. The agent provides the established `test/echo`, `browser/read_tab` and `qrz/webcontact.add` functions plus `edistribuzione/load_profile.month`; the E-Distribuzione result includes the POD, and `mymcp` stores successful monthly profiles in `mymcp/tmpdata/<POD>_YYYY_MM.csv`. Existing agent functions remain unchanged in behavior.
+- `mymcp` Version 1.11 uses the central `googleauth` channel for Google Drive access-token acquisition and adds direct server-side Drive/workspace file transfer. Production `mcp_agent` on the remote Mac is Version 1.33. The agent provides the established `test/echo`, `browser/read_tab` and `qrz/webcontact.add` functions plus `edistribuzione/load_profile.month`; the E-Distribuzione result includes the POD, and `mymcp` stores successful monthly profiles in `mymcp/tmpdata/<POD>_YYYY_MM.csv`. Existing agent functions remain unchanged in behavior.
 - The production service executes `/home/tools/mcp/mymcp`.
 - The Python MCP virtualenv, Python SDK checkout, old `server.py` and related MCP Python runtime files were removed.
 - The C binary uses cJSON, libcurl and libc.
-- Production 1.10 exposes 20 MCP tools, including seven native Drive tools and `agent_call`; the tool behavior is unchanged apart from Drive token acquisition through `googleauth`.
+- Version 1.11 exposes 22 MCP tools, including nine native Drive tools and `agent_call`; `drive_get_file` and `drive_put_file` transfer ordinary files directly between Drive and the calling chat workspace without base64 through the client.
 - `chat` is mandatory.
 - Job ownership by chat works.
 - Request logging is enabled at `/home/tools/mcp/mcp.log` with operational audit fields that do not log file contents or command output.

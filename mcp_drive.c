@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 1.01
+// Gianluca Mazzini @2026- Version 1.02
 
 #include "mcp_drive.h"
 
@@ -58,6 +58,11 @@ struct DriveBuffer {
   unsigned char *data;
   size_t len;
   size_t capacity;
+};
+
+struct DriveFileSink {
+  FILE *file;
+  unsigned long long bytes;
 };
 
 struct DriveSession {
@@ -318,6 +323,7 @@ static int drive_read_googleauth_key(char *key,size_t key_size,char *error,size_
 }
 
 static size_t drive_write_callback(void *ptr,size_t size,size_t nmemb,void *userdata);
+static size_t drive_file_write_callback(void *ptr,size_t size,size_t nmemb,void *userdata);
 
 static int drive_googleauth_token(CURL *curl,char *token,size_t token_size,char *error,size_t error_size) {
   struct curl_slist *headers;
@@ -472,6 +478,19 @@ static size_t drive_write_callback(void *ptr,size_t size,size_t nmemb,void *user
   return bytes;
 }
 
+static size_t drive_file_write_callback(void *ptr,size_t size,size_t nmemb,void *userdata) {
+  struct DriveFileSink *sink;
+  size_t bytes,written;
+
+  sink=(struct DriveFileSink *)userdata;
+  if(size!=0 && nmemb>SIZE_MAX/size) return 0;
+  bytes=size*nmemb;
+  if(bytes==0) return 0;
+  written=fwrite(ptr,1,bytes,sink->file);
+  sink->bytes+=(unsigned long long)written;
+  return written;
+}
+
 static void drive_buffer_free(struct DriveBuffer *buffer) {
   free(buffer->data);
   buffer->data=NULL;
@@ -506,7 +525,7 @@ static int drive_http(struct DriveSession *session,const char *method,const char
   curl_easy_setopt(session->curl,CURLOPT_SSL_VERIFYHOST,2L);
   curl_easy_setopt(session->curl,CURLOPT_CONNECTTIMEOUT,DRIVE_CONNECT_TIMEOUT);
   curl_easy_setopt(session->curl,CURLOPT_TIMEOUT,DRIVE_HTTP_TIMEOUT);
-  curl_easy_setopt(session->curl,CURLOPT_USERAGENT,"mymcp-drive/1.00");
+  curl_easy_setopt(session->curl,CURLOPT_USERAGENT,"mymcp-drive/1.02");
   if(strcmp(method,"GET")!=0) curl_easy_setopt(session->curl,CURLOPT_CUSTOMREQUEST,method);
   if(body!=NULL || body_len>0) {
     curl_easy_setopt(session->curl,CURLOPT_POSTFIELDS,body);
@@ -985,6 +1004,79 @@ int mcp_drive_read_blob(const char *path,long offset,int length,cJSON **data,cha
   return 1;
 }
 
+int mcp_drive_get_file(const char *path,const char *local_path,cJSON **data,char *error,size_t error_size) {
+  struct DriveSession session;
+  struct DriveMapEntry entry;
+  struct DriveFile file;
+  struct DriveFileSink sink;
+  struct curl_slist *headers;
+  CURLcode rc;
+  FILE *f;
+  char url[2048],temp_path[DRIVE_PATH_MAX];
+  long http;
+  int fd,n,ok;
+
+  *data=NULL;
+  memset(&session,0,sizeof(session));
+  if(!drive_valid_path(path) || local_path==NULL || local_path[0]==0) { drive_error(error,error_size,"invalid Drive get-file arguments"); return 0; }
+  if(!drive_resolve(&session,path,&entry,&file,error,error_size)) { drive_session_close(&session); return 0; }
+  if(file.folder) { drive_session_close(&session); drive_error(error,error_size,"Drive item is a folder"); return 0; }
+  if(strncmp(file.mime,"application/vnd.google-apps.",28)==0) { drive_session_close(&session); drive_error(error,error_size,"Google-native documents are not binary files; export is not supported"); return 0; }
+  n=snprintf(temp_path,sizeof(temp_path),"%s.tmp.XXXXXX",local_path);
+  if(n<0 || (size_t)n>=sizeof(temp_path)) { drive_session_close(&session); drive_error(error,error_size,"local path is too long"); return 0; }
+  fd=mkstemp(temp_path);
+  if(fd<0) { drive_session_close(&session); drive_error(error,error_size,"cannot create temporary local file"); return 0; }
+  f=fdopen(fd,"wb");
+  if(f==NULL) { close(fd); unlink(temp_path); drive_session_close(&session); drive_error(error,error_size,"cannot open temporary local file"); return 0; }
+  n=snprintf(url,sizeof(url),"%s/files/%s?alt=media&supportsAllDrives=true",drive_api_base(),file.id);
+  if(n<0 || (size_t)n>=sizeof(url)) { fclose(f); unlink(temp_path); drive_session_close(&session); drive_error(error,error_size,"Drive URL is too long"); return 0; }
+  headers=NULL;
+  headers=curl_slist_append(headers,session.auth);
+  headers=curl_slist_append(headers,"Accept: application/octet-stream");
+  if(headers==NULL) { fclose(f); unlink(temp_path); drive_session_close(&session); drive_error(error,error_size,"out of memory"); return 0; }
+  sink.file=f;
+  sink.bytes=0;
+  curl_easy_reset(session.curl);
+  curl_easy_setopt(session.curl,CURLOPT_URL,url);
+  curl_easy_setopt(session.curl,CURLOPT_HTTPHEADER,headers);
+  curl_easy_setopt(session.curl,CURLOPT_WRITEFUNCTION,drive_file_write_callback);
+  curl_easy_setopt(session.curl,CURLOPT_WRITEDATA,&sink);
+  curl_easy_setopt(session.curl,CURLOPT_SSL_VERIFYPEER,1L);
+  curl_easy_setopt(session.curl,CURLOPT_SSL_VERIFYHOST,2L);
+  curl_easy_setopt(session.curl,CURLOPT_CONNECTTIMEOUT,DRIVE_CONNECT_TIMEOUT);
+  curl_easy_setopt(session.curl,CURLOPT_TIMEOUT,DRIVE_HTTP_TIMEOUT);
+  curl_easy_setopt(session.curl,CURLOPT_USERAGENT,"mymcp-drive/1.02");
+  rc=curl_easy_perform(session.curl);
+  curl_easy_getinfo(session.curl,CURLINFO_RESPONSE_CODE,&http);
+  curl_slist_free_all(headers);
+  ok=1;
+  if(rc!=CURLE_OK || http!=200) ok=0;
+  if(ok && file.size_known && sink.bytes!=(unsigned long long)file.size) ok=0;
+  if(ok && fflush(f)!=0) ok=0;
+  if(ok && fsync(fd)!=0) ok=0;
+  if(fclose(f)!=0) ok=0;
+  if(!ok) {
+    unlink(temp_path);
+    drive_session_close(&session);
+    if(rc!=CURLE_OK) snprintf(url,sizeof(url),"Drive download error: %s",curl_easy_strerror(rc));
+    else if(http!=200) snprintf(url,sizeof(url),"Google Drive HTTP %ld while downloading file",http);
+    else snprintf(url,sizeof(url),"incomplete local Drive download");
+    drive_error(error,error_size,url);
+    return 0;
+  }
+  if(rename(temp_path,local_path)!=0) {
+    unlink(temp_path);
+    drive_session_close(&session);
+    drive_error(error,error_size,"cannot replace local file after Drive download");
+    return 0;
+  }
+  *data=drive_file_json(path,&file,&entry);
+  if(*data!=NULL) cJSON_AddStringToObject(*data,"id",file.id);
+  drive_session_close(&session);
+  if(*data==NULL) { drive_error(error,error_size,"out of memory"); return 0; }
+  return 1;
+}
+
 static unsigned long long drive_stage_hash(const char *chat,const char *path) {
   const unsigned char *p;
   unsigned long long value;
@@ -1126,7 +1218,7 @@ static int drive_upload_stage(struct DriveSession *session,const char *file_id,c
   curl_easy_setopt(session->curl,CURLOPT_SSL_VERIFYHOST,2L);
   curl_easy_setopt(session->curl,CURLOPT_CONNECTTIMEOUT,DRIVE_CONNECT_TIMEOUT);
   curl_easy_setopt(session->curl,CURLOPT_TIMEOUT,DRIVE_HTTP_TIMEOUT);
-  curl_easy_setopt(session->curl,CURLOPT_USERAGENT,"mymcp-drive/1.00");
+  curl_easy_setopt(session->curl,CURLOPT_USERAGENT,"mymcp-drive/1.02");
   rc=curl_easy_perform(session->curl);
   fclose(f);
   curl_slist_free_all(headers);
@@ -1146,6 +1238,8 @@ static const char *drive_mime_for_name(const char *name) {
 
   dot=strrchr(name,'.');
   if(dot!=NULL && strcasecmp(dot,".docx")==0) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if(dot!=NULL && strcasecmp(dot,".pptx")==0) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  if(dot!=NULL && strcasecmp(dot,".xlsx")==0) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
   if(dot!=NULL && strcasecmp(dot,".pdf")==0) return "application/pdf";
   if(dot!=NULL && strcasecmp(dot,".txt")==0) return "text/plain";
   return "application/octet-stream";
@@ -1272,6 +1366,46 @@ int mcp_drive_write_blob(const char *chat,const char *path,const char *expected_
   unlink(meta_path);
   *data=drive_file_json(path,&uploaded,&entry);
   if(*data!=NULL) {
+    cJSON_AddBoolToObject(*data,"committed",1);
+  }
+  drive_session_close(&session);
+  if(*data==NULL) { drive_error(error,error_size,"out of memory"); return 0; }
+  return 1;
+}
+
+int mcp_drive_put_file(const char *path,const char *local_path,const char *expected_version,cJSON **data,char *error,size_t error_size) {
+  struct DriveSession session;
+  struct DriveMapEntry entry,access_entry;
+  struct DriveFile parent,current,uploaded,created;
+  struct stat st;
+  char alias[DRIVE_ALIAS_MAX+1],name[DRIVE_NAME_MAX+1];
+  int found;
+
+  *data=NULL;
+  memset(&session,0,sizeof(session));
+  if(!drive_valid_path(path) || local_path==NULL || local_path[0]==0) { drive_error(error,error_size,"invalid Drive put-file arguments"); return 0; }
+  if(stat(local_path,&st)!=0 || !S_ISREG(st.st_mode)) { drive_error(error,error_size,"local file is unavailable"); return 0; }
+  if(!drive_path_alias(path,alias,sizeof(alias)) || !drive_map_lookup(alias,&access_entry,error,error_size)) return 0;
+  if(!access_entry.writable) { drive_error(error,error_size,"Drive alias is read-only"); return 0; }
+  if(!drive_existing_target(&session,path,&entry,&parent,name,sizeof(name),&current,&found,error,error_size)) { drive_session_close(&session); return 0; }
+  if(found && expected_version!=NULL && expected_version[0]!=0 && strcmp(expected_version,current.version)!=0) {
+    drive_session_close(&session);
+    drive_error(error,error_size,"Drive version conflict before write");
+    return 0;
+  }
+  if(found) {
+    if(!drive_upload_stage(&session,current.id,local_path,current.mime,&uploaded,error,error_size)) { drive_session_close(&session); return 0; }
+  } else {
+    if(!drive_create_file(&session,&parent,name,&created,error,error_size)) { drive_session_close(&session); return 0; }
+    if(!drive_upload_stage(&session,created.id,local_path,drive_mime_for_name(name),&uploaded,error,error_size)) {
+      drive_trash_created(&session,created.id);
+      drive_session_close(&session);
+      return 0;
+    }
+  }
+  *data=drive_file_json(path,&uploaded,&entry);
+  if(*data!=NULL) {
+    cJSON_AddStringToObject(*data,"id",uploaded.id);
     cJSON_AddBoolToObject(*data,"committed",1);
   }
   drive_session_close(&session);

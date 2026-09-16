@@ -245,7 +245,7 @@ def main():
     check("chat" in discover["instructions"],"discover chat instruction missing")
     check("explicitly authorized" in discover["instructions"] and "do not use sleep-based" in discover["instructions"],"discover owner authorization rule missing")
     tools=request(2,"tools/list")["result"]["tools"]
-    check([item["name"] for item in tools]==["hello","write_file","read_file","list_files","read_blob","write_blob","drive_list","drive_stat","drive_read_blob","drive_write_blob","drive_mkdir","drive_rename","drive_delete","run","start","status","tail","stop","jobs","agent_call"],"tools/list failed")
+    check([item["name"] for item in tools]==["hello","write_file","read_file","list_files","read_blob","write_blob","drive_list","drive_stat","drive_read_blob","drive_get_file","drive_put_file","drive_write_blob","drive_mkdir","drive_rename","drive_delete","run","start","status","tail","stop","jobs","agent_call"],"tools/list failed")
     for item in tools:
       required=item["inputSchema"].get("required",[])
       check(required and required[0]=="chat","chat is not first required field for "+item["name"])
@@ -319,6 +319,23 @@ def main():
     new_version=drive_written["version"]
     drive_blob=tool(32,"drive_read_blob",{"path":"docs/doc.docx","offset":0,"length":100})["structuredContent"]
     check(base64.b64decode(drive_blob["data_base64"])==replacement and drive_blob["eof"],"drive_write_blob content mismatch")
+    direct_get=tool(42,"drive_get_file",{"path":"docs/doc.docx","local_path":"drive/direct.docx"})
+    check(not direct_get["isError"],"drive_get_file failed")
+    direct_data=direct_get["structuredContent"]
+    direct_path=os.path.join("/home/tools/mcp/work",CHAT,"drive","direct.docx")
+    check(direct_data.get("local_path")=="drive/direct.docx" and direct_data.get("version")==new_version,"drive_get_file metadata failed")
+    check(open(direct_path,"rb").read()==replacement,"drive_get_file content mismatch")
+    check(tool(43,"drive_get_file",{"path":"docs/doc.docx","local_path":"../escape.docx"})["isError"],"drive_get_file local path escape was accepted")
+    with open(direct_path,"wb") as f:
+      f.write(b"DIRECT")
+    direct_put=tool(44,"drive_put_file",{"local_path":"drive/direct.docx","path":"docs/doc.docx","expected_version":new_version})
+    check(not direct_put["isError"],"drive_put_file failed")
+    direct_written=direct_put["structuredContent"]
+    check(direct_written.get("local_path")=="drive/direct.docx" and direct_written.get("committed") is True,"drive_put_file metadata failed")
+    new_version=direct_written["version"]
+    check(MockDriveHandler.files["file1"]["content"]==b"DIRECT","drive_put_file content mismatch")
+    check(tool(45,"drive_put_file",{"local_path":"../escape.docx","path":"docs/doc.docx"})["isError"],"drive_put_file local path escape was accepted")
+    check(tool(46,"drive_put_file",{"local_path":"drive/direct.docx","path":"docs/doc.docx","expected_version":"999"})["isError"],"drive_put_file version conflict was accepted")
     renamed=tool(33,"drive_rename",{"path":"docs/doc.docx","new_name":"renamed.docx","expected_version":new_version})
     check(not renamed["isError"] and renamed["structuredContent"]["path"]=="docs/renamed.docx","drive_rename failed")
     rename_version=renamed["structuredContent"]["version"]
