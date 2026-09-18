@@ -1,0 +1,18 @@
+CC=cc
+CFLAGS_BASE=-std=gnu89 -O2 -Wall -Wextra -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wconversion -Wno-sign-conversion
+CURL_PREFIX=$(shell brew --prefix curl)
+CJSON_PREFIX=$(shell brew --prefix cjson)
+PKG_CONFIG_PATH=$(CURL_PREFIX)/lib/pkgconfig:$(CJSON_PREFIX)/lib/pkgconfig
+PKG_CFLAGS=$(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --cflags libcjson libcurl)
+PKG_LIBS=$(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --libs libcjson libcurl)
+
+all: mcp_agent gmcp
+
+mcp_agent: mcp_agent.c
+	$(CC) $(CFLAGS_BASE) $(PKG_CFLAGS) mcp_agent.c $(PKG_LIBS) -o mcp_agent
+
+gmcp: gmcp.c
+	$(CC) $(CFLAGS_BASE) $(PKG_CFLAGS) gmcp.c $(PKG_LIBS) -o gmcp
+
+clean:
+	rm -f mcp_agent gmcp

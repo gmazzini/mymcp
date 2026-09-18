@@ -1,4 +1,4 @@
-// Gianluca Mazzini @2026- Version 1.11
+// Gianluca Mazzini @2026- Version 1.16
 
 #include <arpa/inet.h>
 #include <cjson/cJSON.h>
@@ -24,18 +24,16 @@
 #include <unistd.h>
 
 #define SERVER_NAME "mymcp"
-#define SERVER_VERSION "1.11"
+#define SERVER_VERSION "1.16"
 #define PROTOCOL_VERSION "2026-07-28"
 #define WORK_DIR "/home/tools/mcp/work"
 #ifndef JOBS_DIR
 #define JOBS_DIR "/home/tools/mcp/work/jobs"
 #endif
-#ifndef LOG_FILE
-#define LOG_FILE "/home/tools/mcp/mcp.log"
-#endif
 #define DEFAULT_ADDR "127.0.0.1"
 #define DEFAULT_PORT 8000
 #define BACKLOG 32
+#define SERVER_RELOAD 1
 #define MAX_HEADER 32768
 #define MAX_BODY 8388608
 #define MAX_OUTPUT 200000
@@ -44,11 +42,8 @@
 #define MAX_TAIL_LINES 1000
 #define RUN_TIMEOUT 60
 #define JOB_ID_LEN 16
+#define JOB_RETENTION_SECONDS 604800
 #define CHAT_MAX 64
-#define CLIENT_MAX 96
-#define LOG_VALUE_MAX 2048
-#define LOG_DETAIL_MAX 4608
-#define LOG_LINE_MAX 5632
 #define AGENT_ID_MAX 64
 #define AGENT_TOKEN_MAX 255
 #define AGENT_NAME_MAX 64
@@ -56,6 +51,7 @@
 #define AGENT_WAIT_SECONDS 25
 #define AGENT_CALL_TIMEOUT 30
 #define AGENT_CALL_TIMEOUT_MAX 300
+#define AGENT_DONE_RETENTION 3600
 #define AGENT_CONFIG_DEFAULT "/home/tools/mcp/agent.conf"
 #define AGENT_DIR_DEFAULT "/home/tools/mcp/agent"
 
@@ -98,6 +94,32 @@ typedef struct {
   double started_epoch;
 } JobIndex;
 
+static volatile sig_atomic_t reload_requested;
+
+static void reload_signal(int sig) {
+  (void)sig;
+  reload_requested=1;
+}
+
+static int install_reload_handler(void) {
+  struct sigaction sa;
+
+  memset(&sa,0,sizeof(sa));
+  sa.sa_handler=reload_signal;
+  sigemptyset(&sa.sa_mask);
+  return sigaction(SIGHUP,&sa,NULL);
+}
+
+static int current_executable_path(char *out,size_t out_size) {
+  ssize_t n;
+
+  if(out_size<2) return -1;
+  n=readlink("/proc/self/exe",out,out_size-1);
+  if(n<0 || (size_t)n>=out_size-1) return -1;
+  out[n]=0;
+  return 0;
+}
+
 static double now_seconds(void) {
   struct timeval tv;
 
@@ -117,74 +139,6 @@ static int valid_chat(const char *chat) {
     if(!isalnum(c) && c!='_' && c!='-' && c!='.') return 0;
   }
   return 1;
-}
-
-static int check_log_file(void) {
-  int fd;
-
-  fd=open(LOG_FILE,O_WRONLY|O_CREAT|O_APPEND,0644);
-  if(fd<0) return -1;
-  close(fd);
-  return 0;
-}
-
-static void log_quote_value(const char *src,char *dst,size_t dst_size) {
-  size_t i,j;
-  unsigned char c;
-  int truncated;
-
-  if(dst_size==0) return;
-  i=0; j=0; truncated=0;
-  if(j+1<dst_size) dst[j++]='"';
-  if(src!=NULL) {
-    for(i=0;src[i]!=0 && i<LOG_VALUE_MAX;i++) {
-      c=(unsigned char)src[i];
-      if(c=='\n' || c=='\r' || c=='\t' || iscntrl(c)) c=' ';
-      if((c=='"' || c=='\\') && j+2<dst_size) dst[j++]='\\';
-      if(j+1>=dst_size) { truncated=1; break; }
-      dst[j++]=(char)c;
-    }
-    if(src[i]!=0) truncated=1;
-  }
-  if(truncated && j+4<dst_size) {
-    dst[j++]='.'; dst[j++]='.'; dst[j++]='.';
-  }
-  if(j+1<dst_size) dst[j++]='"';
-  dst[j]=0;
-}
-
-static void log_request_detail(const char *chat,const char *client,const char *method,
-  const char *name,const char *detail,int rc,double elapsed_ms) {
-  char timestamp[64],line[LOG_LINE_MAX];
-  struct tm tmv;
-  time_t now;
-  int fd,n;
-
-  now=time(NULL);
-  localtime_r(&now,&tmv);
-  strftime(timestamp,sizeof(timestamp),"%Y-%m-%dT%H:%M:%S%z",&tmv);
-  if(name!=NULL && name[0]!=0 && detail!=NULL && detail[0]!=0)
-    n=snprintf(line,sizeof(line),"%s chat=%s client=%s method=%s name=%s %s rc=%d elapsed_ms=%.0f\n",
-      timestamp,chat!=NULL?chat:"-",client!=NULL?client:"unknown",method!=NULL?method:"-",
-      name,detail,rc,elapsed_ms);
-  else if(name!=NULL && name[0]!=0)
-    n=snprintf(line,sizeof(line),"%s chat=%s client=%s method=%s name=%s rc=%d elapsed_ms=%.0f\n",
-      timestamp,chat!=NULL?chat:"-",client!=NULL?client:"unknown",method!=NULL?method:"-",
-      name,rc,elapsed_ms);
-  else
-    n=snprintf(line,sizeof(line),"%s chat=%s client=%s method=%s rc=%d elapsed_ms=%.0f\n",
-      timestamp,chat!=NULL?chat:"-",client!=NULL?client:"unknown",method!=NULL?method:"-",
-      rc,elapsed_ms);
-  if(n<0 || (size_t)n>=sizeof(line)) return;
-  fd=open(LOG_FILE,O_WRONLY|O_CREAT|O_APPEND,0644);
-  if(fd<0) return;
-  write(fd,line,(size_t)n);
-  close(fd);
-}
-
-static void log_request(const char *chat,const char *client,const char *method,
-  const char *name,int rc,double elapsed_ms) {
-  log_request_detail(chat,client,method,name,NULL,rc,elapsed_ms);
 }
 
 static int send_all(int fd,const char *buf,size_t len) {
@@ -775,13 +729,16 @@ static cJSON *read_json_path(const char *path) {
   return root;
 }
 
+static void agent_cleanup(void);
+
 static int agent_enqueue(const char *chat,const char *target_agent,const char *module,const char *action,
-  cJSON *payload,char *request_id,size_t request_id_size) {
+  cJSON *payload,int timeout,char *request_id,size_t request_id_size) {
   cJSON *root,*copy;
   char path[PATH_MAX];
   int attempts;
 
   if(ensure_agent_dirs()!=0) return -1;
+  agent_cleanup();
   for(attempts=0;attempts<20;attempts++) {
     if(make_agent_request_id(request_id,request_id_size)!=0) return -1;
     if(agent_file_path("queue",request_id,path,sizeof(path))!=0) return -1;
@@ -803,6 +760,7 @@ static int agent_enqueue(const char *chat,const char *target_agent,const char *m
   }
   cJSON_AddItemToObject(root,"payload",copy);
   cJSON_AddNumberToObject(root,"created_epoch",now_seconds());
+  cJSON_AddNumberToObject(root,"expires_epoch",now_seconds()+(double)timeout);
   if(write_json_atomic(path,root)!=0) {
     cJSON_Delete(root);
     return -1;
@@ -824,10 +782,67 @@ static int request_filename_id(const char *name,char *request_id,size_t out_size
   return valid_agent_request_id(request_id)?0:-1;
 }
 
+static void agent_cleanup_queue(void) {
+  DIR *d;
+  struct dirent *de;
+  cJSON *root,*expires_item;
+  char dir_path[PATH_MAX],path[PATH_MAX],request_id[AGENT_REQUEST_ID_LEN+1];
+  double now;
+  int n;
+
+  n=snprintf(dir_path,sizeof(dir_path),"%s/queue",agent_root_dir());
+  if(n<0 || (size_t)n>=sizeof(dir_path)) return;
+  d=opendir(dir_path);
+  if(d==NULL) return;
+  now=now_seconds();
+  for(; (de=readdir(d))!=NULL;) {
+    if(request_filename_id(de->d_name,request_id,sizeof(request_id))!=0) continue;
+    n=snprintf(path,sizeof(path),"%s/%s",dir_path,de->d_name);
+    if(n<0 || (size_t)n>=sizeof(path)) continue;
+    root=read_json_path(path);
+    if(!cJSON_IsObject(root)) {
+      cJSON_Delete(root);
+      continue;
+    }
+    expires_item=cJSON_GetObjectItemCaseSensitive(root,"expires_epoch");
+    if(cJSON_IsNumber(expires_item) && now>=expires_item->valuedouble) unlink(path);
+    cJSON_Delete(root);
+  }
+  closedir(d);
+}
+
+static void agent_cleanup_done(void) {
+  DIR *d;
+  struct dirent *de;
+  struct stat st;
+  char dir_path[PATH_MAX],path[PATH_MAX],request_id[AGENT_REQUEST_ID_LEN+1];
+  time_t now;
+  int n;
+
+  n=snprintf(dir_path,sizeof(dir_path),"%s/done",agent_root_dir());
+  if(n<0 || (size_t)n>=sizeof(dir_path)) return;
+  d=opendir(dir_path);
+  if(d==NULL) return;
+  now=time(NULL);
+  for(; (de=readdir(d))!=NULL;) {
+    if(request_filename_id(de->d_name,request_id,sizeof(request_id))!=0) continue;
+    n=snprintf(path,sizeof(path),"%s/%s",dir_path,de->d_name);
+    if(n<0 || (size_t)n>=sizeof(path)) continue;
+    if(lstat(path,&st)!=0 || !S_ISREG(st.st_mode)) continue;
+    if(now>=st.st_mtime && now-st.st_mtime>AGENT_DONE_RETENTION) unlink(path);
+  }
+  closedir(d);
+}
+
+static void agent_cleanup(void) {
+  agent_cleanup_queue();
+  agent_cleanup_done();
+}
+
 static cJSON *agent_claim_next(const char *agent_id,const char *modules) {
   DIR *d;
   struct dirent *de;
-  cJSON *root,*module_item,*target_item,*created_item;
+  cJSON *root,*module_item,*target_item,*created_item,*expires_item;
   char dir_path[PATH_MAX],path[PATH_MAX],best_id[AGENT_REQUEST_ID_LEN+1],request_id[AGENT_REQUEST_ID_LEN+1];
   char queue_path[PATH_MAX],running_path[PATH_MAX];
   double created,best_created;
@@ -851,6 +866,12 @@ static cJSON *agent_claim_next(const char *agent_id,const char *modules) {
     module_item=cJSON_GetObjectItemCaseSensitive(root,"module");
     target_item=cJSON_GetObjectItemCaseSensitive(root,"target_agent");
     created_item=cJSON_GetObjectItemCaseSensitive(root,"created_epoch");
+    expires_item=cJSON_GetObjectItemCaseSensitive(root,"expires_epoch");
+    if(cJSON_IsNumber(expires_item) && now_seconds()>=expires_item->valuedouble) {
+      cJSON_Delete(root);
+      unlink(path);
+      continue;
+    }
     if(!cJSON_IsString(module_item) || !agent_module_allowed(modules,module_item->valuestring) || !cJSON_IsNumber(created_item)) {
       cJSON_Delete(root);
       continue;
@@ -888,11 +909,14 @@ static cJSON *agent_claim_next(const char *agent_id,const char *modules) {
   return root;
 }
 
-static cJSON *agent_done_read(const char *request_id) {
+static cJSON *agent_done_take(const char *request_id) {
+  cJSON *root;
   char path[PATH_MAX];
 
   if(agent_file_path("done",request_id,path,sizeof(path))!=0) return NULL;
-  return read_json_path(path);
+  root=read_json_path(path);
+  if(cJSON_IsObject(root)) unlink(path);
+  return root;
 }
 
 static int agent_request_state(const char *request_id) {
@@ -1088,6 +1112,7 @@ static int handle_agent_connection(int fd,HttpRequest *http) {
     cJSON_Delete(response);
     return 503;
   }
+  agent_cleanup();
   if(strcmp(http->agent_action,"wait")==0) {
     started=now_seconds();
     for(;;) {
@@ -1535,157 +1560,6 @@ static int get_bool_arg(cJSON *args,const char *name,int *value,int default_valu
   if(!cJSON_IsBool(item)) return -1;
   *value=cJSON_IsTrue(item)?1:0;
   return 1;
-}
-
-static int tool_result_is_error(cJSON *result) {
-  cJSON *item;
-
-  if(!cJSON_IsObject(result)) return 1;
-  item=cJSON_GetObjectItemCaseSensitive(result,"isError");
-  if(!cJSON_IsBool(item)) return 1;
-  return cJSON_IsTrue(item)?1:0;
-}
-
-static int tool_run_exit_code(cJSON *result,int *exit_code) {
-  cJSON *structured,*item;
-  char *end;
-  long value;
-
-  if(!cJSON_IsObject(result)) return 0;
-  structured=cJSON_GetObjectItemCaseSensitive(result,"structuredContent");
-  if(!cJSON_IsObject(structured)) return 0;
-  item=cJSON_GetObjectItemCaseSensitive(structured,"result");
-  if(!cJSON_IsString(item) || item->valuestring==NULL) return 0;
-  if(strncmp(item->valuestring,"exit_code=",10)!=0) return 0;
-  errno=0;
-  value=strtol(item->valuestring+10,&end,10);
-  if(errno!=0 || end==item->valuestring+10) return 0;
-  *exit_code=(int)value;
-  return 1;
-}
-
-static void build_tool_log_detail(const char *name,cJSON *args,cJSON *result,
-  char *out,size_t out_size) {
-  cJSON *item,*structured;
-  const char *path,*command,*cwd,*job_id,*stream;
-  char q1[LOG_VALUE_MAX+8],q2[LOG_VALUE_MAX+8];
-  int lines,limit,force,commit,exit_code,is_error,recursive,truncate,length;
-  long offset;
-  size_t bytes;
-
-  if(out_size==0) return;
-  out[0]=0;
-  if(name==NULL || !cJSON_IsObject(args)) return;
-  is_error=tool_result_is_error(result);
-  path=NULL; command=NULL; cwd="."; job_id=NULL; stream="stdout";
-  lines=50; limit=100; force=0; commit=1; recursive=1; truncate=0; length=MAX_BLOB_CHUNK; offset=0; bytes=0;
-
-  if(strcmp(name,"write_file")==0) {
-    get_string_arg(args,"path",&path,0);
-    item=cJSON_GetObjectItemCaseSensitive(args,"content");
-    if(cJSON_IsString(item) && item->valuestring!=NULL) bytes=strlen(item->valuestring);
-    log_quote_value(path,q1,sizeof(q1));
-    snprintf(out,out_size,"path=%s bytes=%lu tool_error=%s",q1,(unsigned long)bytes,is_error?"true":"false");
-  } else if(strcmp(name,"read_file")==0) {
-    get_string_arg(args,"path",&path,0);
-    log_quote_value(path,q1,sizeof(q1));
-    snprintf(out,out_size,"path=%s tool_error=%s",q1,is_error?"true":"false");
-  } else if(strcmp(name,"list_files")==0) {
-    get_string_arg(args,"path",&path,0);
-    get_bool_arg(args,"recursive",&recursive,1);
-    log_quote_value(path,q1,sizeof(q1));
-    snprintf(out,out_size,"path=%s recursive=%s tool_error=%s",q1,recursive?"true":"false",is_error?"true":"false");
-  } else if(strcmp(name,"read_blob")==0) {
-    get_string_arg(args,"path",&path,0);
-    get_long_arg(args,"offset",&offset,0);
-    get_int_arg(args,"length",&length,MAX_BLOB_CHUNK);
-    log_quote_value(path,q1,sizeof(q1));
-    snprintf(out,out_size,"path=%s offset=%ld length=%d tool_error=%s",q1,offset,length,is_error?"true":"false");
-  } else if(strcmp(name,"write_blob")==0) {
-    get_string_arg(args,"path",&path,0);
-    get_long_arg(args,"offset",&offset,0);
-    get_bool_arg(args,"truncate",&truncate,0);
-    item=cJSON_GetObjectItemCaseSensitive(args,"data_base64");
-    if(cJSON_IsString(item) && item->valuestring!=NULL) bytes=strlen(item->valuestring);
-    log_quote_value(path,q1,sizeof(q1));
-    snprintf(out,out_size,"path=%s offset=%ld base64_chars=%lu truncate=%s tool_error=%s",q1,offset,(unsigned long)bytes,truncate?"true":"false",is_error?"true":"false");
-  } else if(strcmp(name,"drive_list")==0) {
-    get_string_arg(args,"path",&path,0);
-    get_bool_arg(args,"recursive",&recursive,0);
-    log_quote_value(path,q1,sizeof(q1));
-    snprintf(out,out_size,"path=%s recursive=%s tool_error=%s",q1,recursive?"true":"false",is_error?"true":"false");
-  } else if(strcmp(name,"drive_stat")==0 || strcmp(name,"drive_mkdir")==0 || strcmp(name,"drive_delete")==0) {
-    get_string_arg(args,"path",&path,0);
-    log_quote_value(path,q1,sizeof(q1));
-    snprintf(out,out_size,"path=%s tool_error=%s",q1,is_error?"true":"false");
-  } else if(strcmp(name,"drive_get_file")==0 || strcmp(name,"drive_put_file")==0) {
-    get_string_arg(args,"path",&path,0);
-    get_string_arg(args,"local_path",&command,0);
-    log_quote_value(path,q1,sizeof(q1));
-    log_quote_value(command,q2,sizeof(q2));
-    snprintf(out,out_size,"path=%s local_path=%s tool_error=%s",q1,q2,is_error?"true":"false");
-  } else if(strcmp(name,"drive_read_blob")==0) {
-    get_string_arg(args,"path",&path,0);
-    get_long_arg(args,"offset",&offset,0);
-    get_int_arg(args,"length",&length,MAX_BLOB_CHUNK);
-    log_quote_value(path,q1,sizeof(q1));
-    snprintf(out,out_size,"path=%s offset=%ld length=%d tool_error=%s",q1,offset,length,is_error?"true":"false");
-  } else if(strcmp(name,"drive_write_blob")==0) {
-    get_string_arg(args,"path",&path,0);
-    get_long_arg(args,"offset",&offset,0);
-    get_bool_arg(args,"truncate",&truncate,0);
-    get_bool_arg(args,"commit",&commit,1);
-    item=cJSON_GetObjectItemCaseSensitive(args,"data_base64");
-    if(cJSON_IsString(item) && item->valuestring!=NULL) bytes=strlen(item->valuestring);
-    log_quote_value(path,q1,sizeof(q1));
-    snprintf(out,out_size,"path=%s offset=%ld base64_chars=%lu truncate=%s commit=%s tool_error=%s",q1,offset,(unsigned long)bytes,truncate?"true":"false",commit?"true":"false",is_error?"true":"false");
-  } else if(strcmp(name,"drive_rename")==0) {
-    get_string_arg(args,"path",&path,0);
-    get_string_arg(args,"new_name",&command,0);
-    log_quote_value(path,q1,sizeof(q1));
-    log_quote_value(command,q2,sizeof(q2));
-    snprintf(out,out_size,"path=%s new_name=%s tool_error=%s",q1,q2,is_error?"true":"false");
-  } else if(strcmp(name,"run")==0) {
-    get_string_arg(args,"command",&command,0);
-    get_string_arg(args,"cwd",&cwd,0);
-    log_quote_value(cwd,q1,sizeof(q1));
-    log_quote_value(command,q2,sizeof(q2));
-    if(tool_run_exit_code(result,&exit_code))
-      snprintf(out,out_size,"cwd=%s command=%s exit_code=%d tool_error=%s",q1,q2,exit_code,is_error?"true":"false");
-    else
-      snprintf(out,out_size,"cwd=%s command=%s tool_error=%s",q1,q2,is_error?"true":"false");
-  } else if(strcmp(name,"start")==0) {
-    get_string_arg(args,"command",&command,0);
-    get_string_arg(args,"cwd",&cwd,0);
-    log_quote_value(cwd,q1,sizeof(q1));
-    log_quote_value(command,q2,sizeof(q2));
-    structured=cJSON_GetObjectItemCaseSensitive(result,"structuredContent");
-    item=cJSON_IsObject(structured)?cJSON_GetObjectItemCaseSensitive(structured,"job_id"):NULL;
-    job_id=cJSON_IsString(item)?item->valuestring:NULL;
-    if(job_id!=NULL)
-      snprintf(out,out_size,"cwd=%s command=%s job_id=%s tool_error=%s",q1,q2,job_id,is_error?"true":"false");
-    else
-      snprintf(out,out_size,"cwd=%s command=%s tool_error=%s",q1,q2,is_error?"true":"false");
-  } else if(strcmp(name,"status")==0) {
-    get_string_arg(args,"job_id",&job_id,0);
-    snprintf(out,out_size,"job_id=%s tool_error=%s",job_id!=NULL?job_id:"-",is_error?"true":"false");
-  } else if(strcmp(name,"tail")==0) {
-    get_string_arg(args,"job_id",&job_id,0);
-    get_int_arg(args,"lines",&lines,50);
-    get_string_arg(args,"stream",&stream,0);
-    snprintf(out,out_size,"job_id=%s stream=%s lines=%d tool_error=%s",
-      job_id!=NULL?job_id:"-",stream!=NULL?stream:"stdout",lines,is_error?"true":"false");
-  } else if(strcmp(name,"stop")==0) {
-    get_string_arg(args,"job_id",&job_id,0);
-    get_bool_arg(args,"force",&force,0);
-    snprintf(out,out_size,"job_id=%s force=%s tool_error=%s",
-      job_id!=NULL?job_id:"-",force?"true":"false",is_error?"true":"false");
-  } else if(strcmp(name,"jobs")==0) {
-    get_int_arg(args,"limit",&limit,100);
-    snprintf(out,out_size,"limit=%d tool_error=%s",limit,is_error?"true":"false");
-  } else if(strcmp(name,"hello")==0) {
-    snprintf(out,out_size,"tool_error=%s",is_error?"true":"false");
-  }
 }
 
 static cJSON *tool_hello(cJSON *args) {
@@ -2207,6 +2081,36 @@ static int job_dir_path(const char *job_id,char *out,size_t out_size) {
   return 0;
 }
 
+static time_t job_last_activity(const char *dir) {
+  static const char *names[]={"meta.json","stdout.log","stderr.log","exit_code"};
+  struct stat st;
+  char path[PATH_MAX];
+  time_t latest;
+  size_t i;
+  int n;
+
+  latest=0;
+  for(i=0;i<sizeof(names)/sizeof(names[0]);i++) {
+    n=snprintf(path,sizeof(path),"%s/%s",dir,names[i]);
+    if(n<0 || (size_t)n>=sizeof(path)) continue;
+    if(lstat(path,&st)==0 && S_ISREG(st.st_mode) && st.st_mtime>latest) latest=st.st_mtime;
+  }
+  return latest;
+}
+
+static void remove_job_dir(const char *dir) {
+  static const char *names[]={"meta.json","meta.json.new","stdout.log","stderr.log","exit_code"};
+  char path[PATH_MAX];
+  size_t i;
+  int n;
+
+  for(i=0;i<sizeof(names)/sizeof(names[0]);i++) {
+    n=snprintf(path,sizeof(path),"%s/%s",dir,names[i]);
+    if(n>=0 && (size_t)n<sizeof(path)) unlink(path);
+  }
+  rmdir(dir);
+}
+
 static int read_proc_info(pid_t pid,ProcInfo *info) {
   char path[64],buf[4096],*rparen,*save,*tok;
   FILE *f;
@@ -2383,6 +2287,37 @@ static int load_job_meta(const char *job_id,JobMeta *meta) {
   return 0;
 }
 
+static void cleanup_jobs(void) {
+  DIR *d;
+  struct dirent *de;
+  JobMeta meta;
+  GroupStats stats;
+  char dir[PATH_MAX];
+  unsigned long long current_start;
+  time_t now,last;
+  int running;
+
+  d=opendir(JOBS_DIR);
+  if(d==NULL) return;
+  now=time(NULL);
+  for(; (de=readdir(d))!=NULL;) {
+    if(!valid_job_id(de->d_name)) continue;
+    if(job_dir_path(de->d_name,dir,sizeof(dir))!=0) continue;
+    last=job_last_activity(dir);
+    if(last==0 || now<last || now-last<=JOB_RETENTION_SECONDS) continue;
+    if(load_job_meta(de->d_name,&meta)!=0) continue;
+    current_start=proc_start_time(meta.pid);
+    running=0;
+    if(current_start!=0 && current_start==meta.pid_start_time && group_stats(meta.pgid,&stats)==0) {
+      running=stats.count>0;
+      free_group_stats(&stats);
+    }
+    free_job_meta(&meta);
+    if(!running) remove_job_dir(dir);
+  }
+  closedir(d);
+}
+
 static int read_exit_code(const char *job_id,int *code) {
   char dir[PATH_MAX],path[PATH_MAX];
   FILE *f;
@@ -2496,6 +2431,7 @@ static cJSON *tool_start(cJSON *args) {
   if(get_string_arg(args,"cwd",&cwd_arg,0)<0) return tool_result_string("invalid argument: cwd must be a string",1);
   if(command[0]==0) return tool_result_string("command is empty",1);
   if(safe_existing_path(cwd_arg,cwd,sizeof(cwd),1)!=0) return tool_result_string("cwd is not a directory inside work",1);
+  cleanup_jobs();
   if(mkdir(JOBS_DIR,0755)!=0 && errno!=EEXIST) return tool_result_string(strerror(errno),1);
   for(attempts=0;attempts<20;attempts++) {
     if(make_job_id(job_id,sizeof(job_id))!=0) return tool_result_string("cannot generate job id",1);
@@ -2693,6 +2629,7 @@ static cJSON *tool_jobs(cJSON *args) {
   if(get_string_arg(args,"chat",&chat,1)<0 || !valid_chat(chat)) return tool_result_string("invalid chat",1);
   if(get_int_arg(args,"limit",&limit,100)<0 || limit<1) return tool_result_string("limit must be >= 1",1);
   if(limit>1000) limit=1000;
+  cleanup_jobs();
   d=opendir(JOBS_DIR);
   array=cJSON_CreateArray();
   if(d==NULL) return tool_result_json(array,0);
@@ -2837,11 +2774,11 @@ static cJSON *tool_agent_call(cJSON *args) {
     return tool_result_string("timeout out of range",1);
   payload=cJSON_GetObjectItemCaseSensitive(args,"payload");
   if(!agent_module_configured(module,target_agent)) return tool_result_string("no configured agent provides this module",1);
-  if(agent_enqueue(chat,target_agent,module,action,payload,request_id,sizeof(request_id))!=0)
+  if(agent_enqueue(chat,target_agent,module,action,payload,timeout,request_id,sizeof(request_id))!=0)
     return tool_result_string("cannot queue agent request",1);
   started=now_seconds();
   for(;;) {
-    done=agent_done_read(request_id);
+    done=agent_done_take(request_id);
     if(cJSON_IsObject(done)) {
       cJSON_AddStringToObject(done,"state","done");
       status_item=cJSON_GetObjectItemCaseSensitive(done,"status");
@@ -2853,7 +2790,7 @@ static cJSON *tool_agent_call(cJSON *args) {
     if(now_seconds()-started>=(double)timeout) break;
     usleep(50000);
   }
-  done=agent_done_read(request_id);
+  done=agent_done_take(request_id);
   if(cJSON_IsObject(done)) {
     cJSON_AddStringToObject(done,"state","done");
     status_item=cJSON_GetObjectItemCaseSensitive(done,"status");
@@ -2912,24 +2849,6 @@ static cJSON *dispatch_tool(const char *name,cJSON *args) {
   return NULL;
 }
 
-static void request_client(cJSON *params,char *out,size_t out_size) {
-  cJSON *meta,*info,*name,*version;
-
-  if(out_size==0) return;
-  strcpy(out,"unknown");
-  if(!cJSON_IsObject(params)) return;
-  meta=cJSON_GetObjectItemCaseSensitive(params,"_meta");
-  if(!cJSON_IsObject(meta)) return;
-  info=cJSON_GetObjectItemCaseSensitive(meta,"io.modelcontextprotocol/clientInfo");
-  if(!cJSON_IsObject(info)) return;
-  name=cJSON_GetObjectItemCaseSensitive(info,"name");
-  version=cJSON_GetObjectItemCaseSensitive(info,"version");
-  if(!cJSON_IsString(name) || name->valuestring==NULL) return;
-  if(cJSON_IsString(version) && version->valuestring!=NULL)
-    snprintf(out,out_size,"%s/%s",name->valuestring,version->valuestring);
-  else snprintf(out,out_size,"%s",name->valuestring);
-}
-
 static int validate_meta(HttpRequest *http,cJSON *root,cJSON **id,cJSON **params,cJSON **method,int *status,cJSON **error) {
   cJSON *jsonrpc,*meta,*version,*caps,*name;
 
@@ -2958,83 +2877,79 @@ static int validate_meta(HttpRequest *http,cJSON *root,cJSON **id,cJSON **params
 static void handle_connection(int fd) {
   HttpRequest http;
   cJSON *root,*id,*params,*method,*response,*result,*name,*args,*error,*chat_item;
-  char client[CLIENT_MAX],chat[CHAT_MAX+1],method_name[128],tool_name[256],detail[LOG_DETAIL_MAX+1];
-  int rc,status,log_status;
-  double started,elapsed_ms;
+  char chat[CHAT_MAX+1];
+  int rc,status;
 
-  root=NULL; response=NULL; error=NULL; status=200; log_status=400;
-  strcpy(client,"unknown"); strcpy(chat,"-"); strcpy(method_name,"-"); strcpy(tool_name,""); detail[0]=0;
-  started=now_seconds();
+  root=NULL;
+  response=NULL;
+  error=NULL;
+  status=200;
+  strcpy(chat,"-");
   rc=read_http_request(fd,&http);
   if(rc!=0) {
     response=jsonrpc_error(NULL,-32700,rc==-2?"Request too large":"Invalid HTTP request");
     send_json(fd,400,response);
     cJSON_Delete(response);
-    elapsed_ms=(now_seconds()-started)*1000.0;
-    log_request(chat,client,method_name,tool_name,400,elapsed_ms);
     return;
   }
   if(strcmp(http.method,"POST")!=0) {
     response=jsonrpc_error(NULL,-32600,"Only POST is supported");
-    send_json(fd,405,response); cJSON_Delete(response); free_http_request(&http);
-    elapsed_ms=(now_seconds()-started)*1000.0;
-    log_request(chat,client,method_name,tool_name,405,elapsed_ms);
+    send_json(fd,405,response);
+    cJSON_Delete(response);
+    free_http_request(&http);
     return;
   }
   if(strcmp(http.path,"/mcp")!=0) {
     response=jsonrpc_error(NULL,-32600,"MCP endpoint not found");
-    send_json(fd,404,response); cJSON_Delete(response); free_http_request(&http);
-    elapsed_ms=(now_seconds()-started)*1000.0;
-    log_request(chat,client,method_name,tool_name,404,elapsed_ms);
+    send_json(fd,404,response);
+    cJSON_Delete(response);
+    free_http_request(&http);
     return;
   }
   if(http.agent_id[0]!=0 || http.agent_action[0]!=0 || http.agent_token[0]!=0) {
-    snprintf(client,sizeof(client),"agent/%s",http.agent_id[0]!=0?http.agent_id:"unknown");
-    snprintf(method_name,sizeof(method_name),"agent/%s",http.agent_action[0]!=0?http.agent_action:"unknown");
-    status=handle_agent_connection(fd,&http);
+    handle_agent_connection(fd,&http);
     free_http_request(&http);
-    elapsed_ms=(now_seconds()-started)*1000.0;
-    log_request(chat,client,method_name,tool_name,status,elapsed_ms);
     return;
   }
   root=cJSON_ParseWithLength(http.body,http.body_len);
   if(root==NULL) {
     response=jsonrpc_error(NULL,-32700,"Parse error");
-    send_json(fd,400,response); cJSON_Delete(response); free_http_request(&http);
-    elapsed_ms=(now_seconds()-started)*1000.0;
-    log_request(chat,client,method_name,tool_name,400,elapsed_ms);
+    send_json(fd,400,response);
+    cJSON_Delete(response);
+    free_http_request(&http);
     return;
   }
-  params=cJSON_GetObjectItemCaseSensitive(root,"params");
-  request_client(params,client,sizeof(client));
-  method=cJSON_GetObjectItemCaseSensitive(root,"method");
-  if(cJSON_IsString(method) && method->valuestring!=NULL) snprintf(method_name,sizeof(method_name),"%s",method->valuestring);
   if(validate_meta(&http,root,&id,&params,&method,&status,&error)!=0) {
-    send_json(fd,status,error); cJSON_Delete(error); cJSON_Delete(root); free_http_request(&http);
-    elapsed_ms=(now_seconds()-started)*1000.0;
-    log_request(chat,client,method_name,tool_name,status,elapsed_ms);
+    send_json(fd,status,error);
+    cJSON_Delete(error);
+    cJSON_Delete(root);
+    free_http_request(&http);
     return;
   }
   if(strcmp(method->valuestring,"server/discover")==0) result=handle_discover();
   else if(strcmp(method->valuestring,"tools/list")==0) result=handle_tools_list();
-  else if(strcmp(method->valuestring,"ping")==0) { result=cJSON_CreateObject(); cJSON_AddStringToObject(result,"resultType","complete"); add_server_meta(result); }
-  else if(strcmp(method->valuestring,"tools/call")==0) {
+  else if(strcmp(method->valuestring,"ping")==0) {
+    result=cJSON_CreateObject();
+    cJSON_AddStringToObject(result,"resultType","complete");
+    add_server_meta(result);
+  } else if(strcmp(method->valuestring,"tools/call")==0) {
     name=cJSON_GetObjectItemCaseSensitive(params,"name");
     args=cJSON_GetObjectItemCaseSensitive(params,"arguments");
     if(!cJSON_IsString(name)) {
       response=jsonrpc_error(id,-32602,"tool name is required");
-      send_json(fd,200,response); cJSON_Delete(response); cJSON_Delete(root); free_http_request(&http);
-      elapsed_ms=(now_seconds()-started)*1000.0;
-      log_request(chat,client,method_name,tool_name,200,elapsed_ms);
+      send_json(fd,200,response);
+      cJSON_Delete(response);
+      cJSON_Delete(root);
+      free_http_request(&http);
       return;
     }
-    snprintf(tool_name,sizeof(tool_name),"%s",name->valuestring);
     if(args==NULL) args=cJSON_CreateObject();
     else if(!cJSON_IsObject(args)) {
       response=jsonrpc_error(id,-32602,"tool arguments must be an object");
-      send_json(fd,200,response); cJSON_Delete(response); cJSON_Delete(root); free_http_request(&http);
-      elapsed_ms=(now_seconds()-started)*1000.0;
-      log_request(chat,client,method_name,tool_name,200,elapsed_ms);
+      send_json(fd,200,response);
+      cJSON_Delete(response);
+      cJSON_Delete(root);
+      free_http_request(&http);
       return;
     }
     chat_item=cJSON_GetObjectItemCaseSensitive(args,"chat");
@@ -3044,37 +2959,35 @@ static void handle_connection(int fd) {
       result=tool_result_string("chat is required and must contain only a-z A-Z 0-9 _ - .",1);
       if(cJSON_GetObjectItemCaseSensitive(params,"arguments")==NULL) cJSON_Delete(args);
       response=jsonrpc_result(id,result);
-      send_json(fd,200,response); cJSON_Delete(response); cJSON_Delete(root); free_http_request(&http);
-      elapsed_ms=(now_seconds()-started)*1000.0;
-      log_request(chat,client,method_name,tool_name,200,elapsed_ms);
+      send_json(fd,200,response);
+      cJSON_Delete(response);
+      cJSON_Delete(root);
+      free_http_request(&http);
       return;
     }
     result=dispatch_tool(name->valuestring,args);
-    if(result!=NULL) build_tool_log_detail(name->valuestring,args,result,detail,sizeof(detail));
     if(cJSON_GetObjectItemCaseSensitive(params,"arguments")==NULL) cJSON_Delete(args);
     if(result==NULL) {
       response=jsonrpc_error(id,-32602,"unknown tool");
-      send_json(fd,200,response); cJSON_Delete(response); cJSON_Delete(root); free_http_request(&http);
-      elapsed_ms=(now_seconds()-started)*1000.0;
-      log_request(chat,client,method_name,tool_name,200,elapsed_ms);
+      send_json(fd,200,response);
+      cJSON_Delete(response);
+      cJSON_Delete(root);
+      free_http_request(&http);
       return;
     }
   } else {
     response=jsonrpc_error(id,-32601,"Method not found");
-    send_json(fd,200,response); cJSON_Delete(response); cJSON_Delete(root); free_http_request(&http);
-    elapsed_ms=(now_seconds()-started)*1000.0;
-    log_request(chat,client,method_name,tool_name,200,elapsed_ms);
+    send_json(fd,200,response);
+    cJSON_Delete(response);
+    cJSON_Delete(root);
+    free_http_request(&http);
     return;
   }
   response=jsonrpc_result(id,result);
   send_json(fd,200,response);
-  log_status=200;
   cJSON_Delete(response);
   cJSON_Delete(root);
   free_http_request(&http);
-  elapsed_ms=(now_seconds()-started)*1000.0;
-  if(detail[0]!=0) log_request_detail(chat,client,method_name,tool_name,detail,log_status,elapsed_ms);
-  else log_request(chat,client,method_name,tool_name,log_status,elapsed_ms);
 }
 
 static int parse_port(const char *s) {
@@ -3087,13 +3000,108 @@ static int parse_port(const char *s) {
   return (int)p;
 }
 
+static int parse_fixed_decimal(const char *s,int digits,int minimum,int maximum) {
+  int i,value;
+
+  if(s==NULL || (int)strlen(s)!=digits) return -1;
+  value=0;
+  for(i=0;i<digits;i++) {
+    if(!isdigit((unsigned char)s[i])) return -1;
+    value=value*10+(s[i]-'0');
+  }
+  if(value<minimum || value>maximum) return -1;
+  return value;
+}
+
+static int valid_edistribuzione_magnitude(const char *magnitude) {
+  static const char *values[]={"A+","A-","RI+","RC+","RI-","RC-"};
+  size_t i;
+
+  for(i=0;i<sizeof(values)/sizeof(values[0]);i++)
+    if(strcmp(magnitude,values[i])==0) return 1;
+  return 0;
+}
+
+static void agent_call_cli_usage(const char *prog) {
+  printf("usage: %s edistribuzione load_profile.month YYYY MM [MAGNITUDE]\n",prog);
+}
+
+static int agent_call_cli(int argc,char **argv) {
+  cJSON *args,*payload,*reply,*is_error,*data,*result,*csv;
+  char *text;
+  int year,month,rc;
+
+  if(argc==2 && (strcmp(argv[1],"-h")==0 || strcmp(argv[1],"--help")==0)) {
+    agent_call_cli_usage(argv[0]);
+    return 0;
+  }
+  if(argc<3 || strcmp(argv[1],"edistribuzione")!=0 ||
+    strcmp(argv[2],"load_profile.month")!=0) {
+    agent_call_cli_usage(argv[0]);
+    return 2;
+  }
+  if(argc!=5 && argc!=6) {
+    agent_call_cli_usage(argv[0]);
+    return 2;
+  }
+  year=parse_fixed_decimal(argv[3],4,1000,9999);
+  month=parse_fixed_decimal(argv[4],2,1,12);
+  if(year<0 || month<0) {
+    fprintf(stderr,"invalid year or month\n");
+    return 2;
+  }
+  if(argc==6 && !valid_edistribuzione_magnitude(argv[5])) {
+    fprintf(stderr,"invalid magnitude\n");
+    return 2;
+  }
+  args=cJSON_CreateObject();
+  payload=cJSON_CreateObject();
+  if(args==NULL || payload==NULL) {
+    cJSON_Delete(args);
+    cJSON_Delete(payload);
+    fprintf(stderr,"out of memory\n");
+    return 1;
+  }
+  cJSON_AddStringToObject(args,"chat","mymcp");
+  cJSON_AddStringToObject(args,"module","edistribuzione");
+  cJSON_AddStringToObject(args,"action","load_profile.month");
+  cJSON_AddNumberToObject(payload,"year",year);
+  cJSON_AddNumberToObject(payload,"month",month);
+  if(argc==6) cJSON_AddStringToObject(payload,"magnitude",argv[5]);
+  cJSON_AddItemToObject(args,"payload",payload);
+  reply=tool_agent_call(args);
+  cJSON_Delete(args);
+  if(reply==NULL) {
+    fprintf(stderr,"agent_call failed\n");
+    return 1;
+  }
+  is_error=cJSON_GetObjectItemCaseSensitive(reply,"isError");
+  data=cJSON_GetObjectItemCaseSensitive(reply,"structuredContent");
+  rc=cJSON_IsTrue(is_error)?1:0;
+  if(rc==0 && cJSON_IsObject(data)) {
+    result=cJSON_GetObjectItemCaseSensitive(data,"result");
+    csv=cJSON_IsObject(result)?cJSON_GetObjectItemCaseSensitive(result,"csv_file"):NULL;
+    if(cJSON_IsString(csv)) {
+      printf("%s\n",csv->valuestring);
+      cJSON_Delete(reply);
+      return 0;
+    }
+  }
+  text=data!=NULL?cJSON_PrintUnformatted(data):cJSON_PrintUnformatted(reply);
+  if(text!=NULL) {
+    fprintf(rc==0?stdout:stderr,"%s\n",text);
+    free(text);
+  }
+  cJSON_Delete(reply);
+  return rc;
+}
+
 static int server_loop(const char *address,int port) {
   int server_fd,client_fd,one;
   struct sockaddr_in sa;
   socklen_t sa_len;
   pid_t pid;
 
-  if(check_log_file()!=0) return -1;
   server_fd=socket(AF_INET,SOCK_STREAM,0);
   if(server_fd<0) return -1;
   one=1;
@@ -3108,13 +3116,22 @@ static int server_loop(const char *address,int port) {
   signal(SIGPIPE,SIG_IGN);
   fprintf(stderr,"%s %s listening on %s:%d\n",SERVER_NAME,SERVER_VERSION,address,port);
   for(;;) {
+    if(reload_requested) { close(server_fd); return SERVER_RELOAD; }
     sa_len=sizeof(sa);
     client_fd=accept(server_fd,(struct sockaddr *)&sa,&sa_len);
-    if(client_fd<0) { if(errno==EINTR) continue; close(server_fd); return -1; }
+    if(client_fd<0) {
+      if(errno==EINTR) {
+        if(reload_requested) { close(server_fd); return SERVER_RELOAD; }
+        continue;
+      }
+      close(server_fd);
+      return -1;
+    }
     pid=fork();
     if(pid<0) { close(client_fd); continue; }
     if(pid==0) {
       signal(SIGCHLD,SIG_DFL);
+      signal(SIGHUP,SIG_DFL);
       close(server_fd);
       handle_connection(client_fd);
       close(client_fd);
@@ -3125,9 +3142,21 @@ static int server_loop(const char *address,int port) {
 }
 
 int main(int argc,char **argv) {
-  const char *address;
-  int port,i,p;
+  const char *address,*base;
+  char executable[PATH_MAX];
+  int port,i,p,rc;
 
+  base=strrchr(argv[0],'/');
+  base=base!=NULL?base+1:argv[0];
+  if(strcmp(base,"agent_call")==0) return agent_call_cli(argc,argv);
+  if(current_executable_path(executable,sizeof(executable))!=0) {
+    fprintf(stderr,"cannot resolve executable path\n");
+    return 1;
+  }
+  if(install_reload_handler()!=0) {
+    fprintf(stderr,"cannot install reload handler: %s\n",strerror(errno));
+    return 1;
+  }
   address=DEFAULT_ADDR;
   port=DEFAULT_PORT;
   for(i=1;i<argc;i++) {
@@ -3144,7 +3173,13 @@ int main(int argc,char **argv) {
       return 2;
     }
   }
-  if(server_loop(address,port)!=0) {
+  rc=server_loop(address,port);
+  if(rc==SERVER_RELOAD) {
+    execv(executable,argv);
+    fprintf(stderr,"reload exec failed: %s\n",strerror(errno));
+    return 1;
+  }
+  if(rc!=0) {
     fprintf(stderr,"server error: %s\n",strerror(errno));
     return 1;
   }

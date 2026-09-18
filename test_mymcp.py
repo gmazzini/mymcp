@@ -8,14 +8,17 @@ import sys
 import time
 import threading
 import http.server
+import hashlib
+import struct
 import re
+import signal
 import urllib.parse
 
 PORT=18080
 DRIVE_PORT=18081
+CHROME_PORT=18082
 URL="http://127.0.0.1:%d/mcp" % PORT
 CHAT="mymcp-test"
-LOG=os.environ.get("MYMCP_TEST_LOG")
 AGENT_CONFIG=os.environ.get("MYMCP_AGENT_CONFIG")
 AGENT_DIR=os.environ.get("MYMCP_AGENT_DIR")
 META={
@@ -71,6 +74,31 @@ def fake_agent_once():
     "result":{"echo":payload}
   })
   check(result.get("status")=="accepted","agent result was not accepted")
+
+
+def fake_edistribuzione_once():
+  request_data=agent_request("wait")
+  check(request_data.get("status")=="request","edistribuzione agent wait did not receive request")
+  check(request_data.get("module")=="edistribuzione" and request_data.get("action")=="load_profile.month",
+    "wrong edistribuzione agent request")
+  payload=request_data.get("payload",{})
+  check(payload.get("year")==2026 and payload.get("month")==9 and "magnitude" not in payload,
+    "wrong edistribuzione CLI payload")
+  result=agent_request("result",{
+    "request_id":request_data["request_id"],
+    "status":"ok",
+    "result":{
+      "code":"OK",
+      "pod":"TESTPOD",
+      "year":2026,
+      "month":9,
+      "days":[{
+        "date_key":"20260901",
+        "samples":[{"key":"1","value":1.5},{"key":"96","value":2.5}]
+      }]
+    }
+  })
+  check(result.get("status")=="accepted","edistribuzione agent result was not accepted")
 
 
 def check(condition,message):
@@ -216,10 +244,121 @@ def start_mock_drive():
   return server,thread
 
 
+class MockChromeHandler(http.server.BaseHTTPRequestHandler):
+  protocol_version="HTTP/1.1"
+  requests=0
+
+  def log_message(self,format,*args):
+    pass
+
+  def websocket_frame(self,payload):
+    data=payload.encode("utf-8")
+    if len(data)<126:
+      return bytes([0x81,len(data)])+data
+    return bytes([0x81,126])+struct.pack("!H",len(data))+data
+
+  def websocket_read(self):
+    header=self.rfile.read(2)
+    if len(header)!=2:
+      return None
+    length=header[1]&0x7f
+    masked=(header[1]&0x80)!=0
+    if length==126:
+      length=struct.unpack("!H",self.rfile.read(2))[0]
+    elif length==127:
+      length=struct.unpack("!Q",self.rfile.read(8))[0]
+    mask=self.rfile.read(4) if masked else b""
+    data=bytearray(self.rfile.read(length))
+    if masked:
+      for i in range(len(data)):
+        data[i]^=mask[i%4]
+    return data.decode("utf-8")
+
+  def websocket_session(self):
+    key=self.headers.get("Sec-WebSocket-Key","")
+    accept=base64.b64encode(hashlib.sha1((key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
+    self.send_response(101,"Switching Protocols")
+    self.send_header("Upgrade","websocket")
+    self.send_header("Connection","Upgrade")
+    self.send_header("Sec-WebSocket-Accept",accept)
+    self.end_headers()
+    for _ in range(4):
+      text=self.websocket_read()
+      if text is None:
+        return
+      request=json.loads(text)
+      req_id=request.get("id",0)
+      if request.get("method")=="Runtime.evaluate":
+        reply={"id":req_id,"result":{"result":{"type":"string","value":"READY"}}}
+      else:
+        reply={"id":req_id,"result":{}}
+      self.wfile.write(self.websocket_frame(json.dumps(reply,separators=(",",":"))))
+      self.wfile.flush()
+
+  def do_GET(self):
+    self.__class__.requests+=1
+    if self.headers.get("Upgrade","").lower()=="websocket":
+      self.websocket_session()
+      return
+    if self.path!="/json/list":
+      self.send_response(404)
+      self.end_headers()
+      return
+    body=json.dumps([{
+      "type":"page",
+      "title":CHAT+" 2",
+      "url":"https://chatgpt.com/c/abcdefgh12345678",
+      "webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/page/test" % CHROME_PORT
+    }]).encode("utf-8")
+    self.send_response(200)
+    self.send_header("Content-Type","application/json")
+    self.send_header("Content-Length",str(len(body)))
+    self.end_headers()
+    self.wfile.write(body)
+
+
+def start_mock_chrome():
+  server=http.server.HTTPServer(("127.0.0.1",CHROME_PORT),MockChromeHandler)
+  thread=threading.Thread(target=server.serve_forever)
+  thread.daemon=True
+  thread.start()
+  return server,thread
+
+
+def test_watch_check_path(root):
+  source=os.path.join(root,"send_check_test.c")
+  binary=os.path.join(root,"send_check_test")
+  with open(source,"w",encoding="utf-8") as f:
+    f.write('int mcp_agent_original_main(int argc,char **argv);\n')
+    f.write('#define main mcp_agent_original_main\n')
+    f.write('#include "../../mcp_agent.c"\n')
+    f.write('#undef main\n\n')
+    f.write('int main(void) {\n')
+    f.write('  struct ChatState state;\n')
+    f.write('  int rc;\n\n')
+    f.write('  memset(&state,0,sizeof(state));\n')
+    f.write('  snprintf(state.chat,sizeof(state.chat),"%s");\n' % CHAT)
+    f.write('  snprintf(state.conversation_id,sizeof(state.conversation_id),"abcdefgh12345678");\n')
+    f.write('  setenv("MCP_CHROME_URL","http://127.0.0.1:%d",1);\n' % CHROME_PORT)
+    f.write('  if(curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) return 2;\n')
+    f.write('  rc=send_check(&state);\n')
+    f.write('  curl_global_cleanup();\n')
+    f.write('  return rc==0?0:1;\n')
+    f.write('}\n')
+  compile_cmd=["gcc","-std=gnu89","-O2","-Wall","-Wextra","-Wshadow","-Wstrict-prototypes",
+    "-Wmissing-prototypes","-Wconversion","-Wno-sign-conversion",source,"-lcjson","-lcurl","-o",binary]
+  subprocess.check_call(compile_cmd)
+  run=subprocess.run([binary],capture_output=True,text=True,timeout=10)
+  check(run.returncode==0,"integrated watcher CDP check path failed: "+run.stdout+run.stderr)
+  check("WATCH check sent" in run.stdout,"integrated watcher check success log missing")
+
+
 def main():
   server=None
   drive_server=None
   drive_thread=None
+  chrome_server=None
+  chrome_thread=None
   try:
     drive_root=os.path.abspath("tmpdata/regression")
     os.makedirs(os.path.join(drive_root,"drive-stage"),exist_ok=True)
@@ -231,6 +370,8 @@ def main():
       f.write("googleauth_key=test-api-key\n")
     os.chmod(googleauth_config,0o600)
     drive_server,drive_thread=start_mock_drive()
+    chrome_server,chrome_thread=start_mock_chrome()
+    test_watch_check_path(drive_root)
     env=os.environ.copy()
     env["MYMCP_DRIVE_MAP"]=drive_map
     env["MYMCP_GOOGLEAUTH_CONFIG"]=googleauth_config
@@ -266,12 +407,40 @@ def main():
     time.sleep(2.2)
     status=tool(11,"status",{"job_id":job_id})["structuredContent"]
     check(status["state"]=="exited" and status["exit_code"]==0,"status exited failed")
+    reload_started=tool(49,"start",{"command":"echo RELOAD_READY; sleep 10","cwd":"mymcp"})["structuredContent"]
+    reload_job=reload_started["job_id"]
+    time.sleep(.3)
+    server_pid=server.pid
+    os.kill(server_pid,signal.SIGHUP)
+    time.sleep(.4)
+    check(server.poll() is None and server.pid==server_pid,"server did not survive SIGHUP reload with the same PID")
+    reload_status=tool(50,"status",{"job_id":reload_job})["structuredContent"]
+    check(reload_status["state"]=="running","running job did not survive server reload")
+    check("RELOAD_READY" in tool(51,"tail",{"job_id":reload_job,"lines":10})["structuredContent"]["stdout"],"reloaded server lost job output")
+    check(tool(52,"stop",{"job_id":reload_job})["structuredContent"]["signal"]=="SIGTERM","reload test job stop failed")
+    time.sleep(.3)
     started=tool(12,"start",{"command":"echo READY; while :; do sleep 10; done","cwd":"mymcp"})["structuredContent"]
     job_id=started["job_id"]
+    job_dir=os.path.join("/home/tools/mcp/work/jobs",job_id)
     time.sleep(.3)
+    old_job_time=time.time()-8*86400
+    for name in ("meta.json","stdout.log","stderr.log","exit_code"):
+      path=os.path.join(job_dir,name)
+      if os.path.exists(path):
+        os.utime(path,(old_job_time,old_job_time))
+    os.utime(job_dir,(old_job_time,old_job_time))
+    tool(47,"jobs",{"limit":20})
+    check(os.path.isdir(job_dir),"old running job was removed by retention")
     check(tool(13,"stop",{"job_id":job_id,"force":False})["structuredContent"]["signal"]=="SIGTERM","stop failed")
     time.sleep(.3)
     check(tool(14,"status",{"job_id":job_id})["structuredContent"]["state"]=="exited","stop status failed")
+    for name in ("meta.json","stdout.log","stderr.log","exit_code"):
+      path=os.path.join(job_dir,name)
+      if os.path.exists(path):
+        os.utime(path,(old_job_time,old_job_time))
+    os.utime(job_dir,(old_job_time,old_job_time))
+    tool(48,"jobs",{"limit":20})
+    check(not os.path.exists(job_dir),"expired exited job was not removed by retention")
     check(tool(15,"read_file",{"path":"../server.py"})["isError"],"read path escape was accepted")
     check(tool(16,"write_file",{"path":"../escape.txt","content":"bad"})["isError"],"write path escape was accepted")
     jobs=tool(17,"jobs",{"limit":20})["structuredContent"]
@@ -295,6 +464,23 @@ def main():
     check(not tool(25,"write_file",{"path":"mymcp/testdata/test.txt","content":"alpha\nbeta\n"})["isError"],"test file restore failed")
     check(AGENT_CONFIG is not None and AGENT_DIR is not None,"agent test paths are required")
     check(agent_request("wait",token="wrong-token").get("status")=="error","bad agent token was accepted")
+    old=time.time()-172800
+    stale_queue=os.path.join(AGENT_DIR,"queue","req_"+"1"*16+".json")
+    stale_done=os.path.join(AGENT_DIR,"done","req_"+"2"*16+".json")
+    old_running=os.path.join(AGENT_DIR,"running","req_"+"3"*16+".json")
+    for state_dir in (os.path.dirname(stale_queue),os.path.dirname(stale_done),os.path.dirname(old_running)):
+      os.makedirs(state_dir,exist_ok=True)
+    with open(stale_queue,"w",encoding="utf-8") as f:
+      json.dump({"expires_epoch":time.time()-1},f)
+    with open(stale_done,"w",encoding="utf-8") as f:
+      f.write("{}\n")
+    with open(old_running,"w",encoding="utf-8") as f:
+      f.write("{}\n")
+    os.utime(stale_done,(old,old))
+    os.utime(old_running,(old,old))
+    recent=os.path.join(AGENT_DIR,"done","req_"+"4"*16+".json")
+    with open(recent,"w",encoding="utf-8") as f:
+      f.write("{}\n")
     worker=threading.Thread(target=fake_agent_once)
     worker.start()
     time.sleep(.1)
@@ -304,6 +490,61 @@ def main():
     check(not agent_result["isError"],"agent_call returned error")
     agent_data=agent_result["structuredContent"]
     check(agent_data.get("status")=="ok" and agent_data.get("result",{}).get("echo",{}).get("x")==123,"agent_call result mismatch")
+    consumed=os.path.join(AGENT_DIR,"done",agent_data["request_id"]+".json")
+    check(not os.path.exists(stale_queue),"expired queued agent request was not cleaned")
+    check(not os.path.exists(stale_done),"stale orphaned agent result was not cleaned")
+    check(os.path.exists(old_running),"old running agent request was cleaned automatically")
+    check(os.path.exists(recent),"recent orphaned agent result was cleaned too early")
+    check(not os.path.exists(consumed),"consumed agent result was retained")
+    os.unlink(old_running)
+    os.unlink(recent)
+    cli_worker=threading.Thread(target=fake_edistribuzione_once)
+    cli_worker.start()
+    time.sleep(.1)
+    cli=subprocess.run(["./agent_call","edistribuzione","load_profile.month","2026","09"],
+      capture_output=True,text=True,env=env,timeout=10)
+    cli_worker.join(timeout=5)
+    check(not cli_worker.is_alive(),"fake edistribuzione agent did not finish")
+    check(cli.returncode==0,"agent_call CLI failed: "+cli.stderr)
+    check(cli.stdout=="mymcp/tmpdata/TESTPOD_2026_09.csv\n","agent_call CLI output mismatch")
+    cli_csv=os.path.join("tmpdata","TESTPOD_2026_09.csv")
+    with open(cli_csv,"r",encoding="utf-8") as f:
+      cli_csv_text=f.read()
+    check(cli_csv_text=="date,time,value\n2026-09-01,00:00,1.5\n2026-09-01,23:45,2.5\n",
+      "agent_call CLI CSV mismatch")
+    os.unlink(cli_csv)
+    client_env=os.environ.copy()
+    client_env["MCP_AGENT_URL"]=URL
+    client_env["MCP_AGENT_ID"]="test-agent"
+    client_env["MCP_TOKEN"]="outer-test"
+    client_env["MCP_AGENT_TOKEN"]="test-token"
+    client_env["MCP_CHROME_URL"]="http://127.0.0.1:%d" % CHROME_PORT
+    MockChromeHandler.requests=0
+    client=subprocess.Popen(["./mcp_agent"],env=client_env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    time.sleep(.2)
+    client_result=tool(60,"agent_call",{"agent":"test-agent","module":"test","action":"echo","payload":{"client":321},"timeout":5})
+    client_data=client_result["structuredContent"]
+    check(not client_result["isError"] and client_data.get("result",{}).get("client")==321,"unified mcp_agent result mismatch")
+    check(client.poll() is None,"unified mcp_agent exited after agent request")
+    check(MockChromeHandler.requests>0,"integrated watcher did not scan Chrome")
+    client.terminate()
+    client_out,client_err=client.communicate(timeout=5)
+    check(" WATCH " in client_out,"mcp_agent watcher runtime log missing")
+    check(" AGENT received " in client_out,"mcp_agent agent request runtime log missing")
+    check(" AGENT result delivered " in client_out,"mcp_agent result runtime log missing")
+
+    check(subprocess.run(["./mcp_agent","invalid"],env=client_env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==2,
+      "unexpected mcp_agent argument was accepted")
+
+    bad_env=client_env.copy()
+    bad_env["MCP_AGENT_URL"]="http://127.0.0.1:19998/mcp"
+    bad_env["MCP_CHROME_URL"]="http://127.0.0.1:19997"
+    survivor=subprocess.Popen(["./mcp_agent"],env=bad_env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    time.sleep(3)
+    check(survivor.poll() is None,"unified mcp_agent exited during network outage")
+    survivor.terminate()
+    survivor.wait(timeout=5)
+
     check(tool(27,"agent_call",{"module":"missing","action":"echo","timeout":1})["isError"],"missing agent module was accepted")
     drive_stat=tool(28,"drive_stat",{"path":"docs/doc.docx"})["structuredContent"]
     check(drive_stat["version"]=="1" and drive_stat["size"]==6 and drive_stat["mode"]=="rw","drive_stat failed")
@@ -352,21 +593,6 @@ def main():
     deleted=tool(40,"drive_delete",{"path":"docs/renamed.docx","expected_version":rename_version})
     check(not deleted["isError"] and deleted["structuredContent"].get("trashed") is True,"drive_delete failed")
     check(tool(41,"drive_stat",{"path":"docs/renamed.docx"})["isError"],"trashed Drive file remained visible")
-    if LOG:
-      time.sleep(.1)
-      text=open(LOG,"r",encoding="utf-8").read()
-      check('name=write_file path="mymcp/testdata/test.txt" bytes=11 tool_error=false' in text,"write_file audit log missing")
-      check('name=read_file path="mymcp/testdata/test.txt" tool_error=false' in text,"read_file audit log missing")
-      check('name=list_files path="mymcp/testdata" recursive=true tool_error=false' in text,"list_files audit log missing")
-      check('name=read_blob path="mymcp/testdata/test.txt" offset=2 length=3 tool_error=false' in text,"read_blob audit log missing")
-      check('name=write_blob path="mymcp/testdata/test.txt" offset=0 base64_chars=' in text and 'truncate=true tool_error=false' in text,"write_blob audit log missing")
-      check('name=run cwd="mymcp"' in text and 'exit_code=7 tool_error=false' in text and "printf 'OUT" in text,"run audit log missing")
-      check('name=start cwd="mymcp" command="echo READY; sleep 2; echo DONE" job_id=job_' in text,"start audit log missing")
-      check('name=tail job_id=job_' in text and 'stream=both lines=10 tool_error=false' in text,"tail audit log missing")
-      check('name=stop job_id=job_' in text and 'force=false tool_error=false' in text,"stop audit log missing")
-      check('name=jobs limit=20 tool_error=false' in text,"jobs audit log missing")
-      check('path="../escape.txt" bytes=3 tool_error=true' in text,"tool error audit log missing")
-      check("alpha\nbeta" not in text,"write_file content leaked into audit log")
     print("===== OK: MYMCP TESTS PASSED =====")
     return 0
   finally:
@@ -382,6 +608,11 @@ def main():
       drive_server.server_close()
     if drive_thread is not None:
       drive_thread.join(timeout=2)
+    if chrome_server is not None:
+      chrome_server.shutdown()
+      chrome_server.server_close()
+    if chrome_thread is not None:
+      chrome_thread.join(timeout=2)
 
 
 if __name__=="__main__":

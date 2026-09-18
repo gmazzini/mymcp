@@ -83,10 +83,10 @@ The source follows the user's C style rules.
 - Source header format is:
 
 ```c
-// Gianluca Mazzini @2026- Version 1.11
+// Gianluca Mazzini @2026- Version 1.16
 ```
 
-The initial development year and major version are user-controlled. Version 1.11 is the current implemented and tested development version.
+The initial development year and major version are user-controlled. Version 1.16 is the current development version. Each functional change gets its own release number; unrelated functional changes are not grouped into one release.
 
 
 ## Dependencies
@@ -129,26 +129,50 @@ make
 
 The Makefile currently builds with strict warnings and optimization.
 
-Expected output binaries:
+Expected build outputs:
 
 ```text
 /home/tools/mcp/work/mymcp/mymcp
 /home/tools/mcp/work/mymcp/mcp_agent
+/home/tools/mcp/work/mymcp/agent_call -> mymcp
 ```
 
+agent_call is a visible symlink to the same mymcp executable. The binary selects CLI mode from argv[0], so the command-line client and the MCP server share the same agent transport implementation.
+
 The build should finish with zero compiler warnings before deployment.
+
+### macOS client build
+
+The macOS side needs three project files: `mcp_agent.c`, `gmcp.c` and `Makefile.mac`. `mcp_agent` is the unified always-running agent/watcher; `gmcp` remains the daily command-line client. The old standalone Chrome/check helper and watcher are no longer part of the macOS side.
+
+On the Mac, from the local MCP directory:
+
+```sh
+cd /Users/gmazzini/mcp
+scp -P 56789 root@s018.mazzini.org:/home/tools/mcp/work/mymcp/{mcp_agent.c,gmcp.c,Makefile.mac} .
+make -f Makefile.mac
+```
+
+`Makefile.mac` discovers the Homebrew prefixes for `curl` and `cjson`, builds with the same strict C89 warning set used by the project, and produces:
+
+```text
+mcp_agent
+gmcp
+```
+
+It assumes Homebrew `curl`, `cjson` and `pkg-config` are already installed. Normal background operation requires only `./mcp_agent`; `gmcp` remains available for the daily command-line operations. There are no separate watcher or Chrome-helper processes to compile or start.
 
 
 ## Tests
 
-`test_mymcp.py` is the permanent regression test for the server. It runs a separate local instance on port 18080 and exercises discovery, all local file/blob tools, Google Drive tools through an isolated mock Drive API, synchronous and asynchronous jobs, ownership isolation, path protection and an end-to-end fake-agent `agent_call`.
+`test_mymcp.py` is the permanent regression test for the server and unified macOS client. It runs a separate local server on port 18080 and exercises discovery, all local file/blob tools, Google Drive tools through an isolated mock Drive API, synchronous and asynchronous jobs, ownership isolation, path protection, the generic agent transport, the local `agent_call` CLI, the unified `mcp_agent` running agent and watcher together through a mock Chrome endpoint, rejection of obsolete operating modes, and survival of temporary MCP/Chrome unavailability.
 
-The agent part requires an isolated test configuration. From the project directory:
+The agent/client part requires an isolated test configuration. From the project directory:
 
 ```sh
 rm -rf tmpdata/regression
 mkdir -p tmpdata/regression/agent
-printf '%s\n' 'test-agent test-token test' > tmpdata/regression/agent.conf
+printf '%s\n' 'test-agent test-token test,edistribuzione' > tmpdata/regression/agent.conf
 MYMCP_AGENT_CONFIG="$PWD/tmpdata/regression/agent.conf" \
 MYMCP_AGENT_DIR="$PWD/tmpdata/regression/agent" \
 python3 test_mymcp.py
@@ -166,11 +190,14 @@ The systemd service is:
 /etc/systemd/system/mcp.service
 ```
 
-Its production command is:
+Its production command and reload action are:
 
 ```text
 ExecStart=/home/tools/mcp/mymcp
+ExecReload=/bin/kill -HUP $MAINPID
 ```
+
+`KillMode=control-group` remains intentional. A normal `stop` or `restart` is the hard-cleanup path and terminates the server together with every asynchronous job still in the service cgroup. `reload` is the non-destructive update path: Version 1.15 handles `SIGHUP` in the main server process, closes the listening socket and `exec()`s the executable path that was resolved at startup. The main PID is preserved and existing job supervisors/process groups continue running.
 
 The service runs as:
 
@@ -183,13 +210,27 @@ Do not deploy automatically unless explicitly requested by the user.
 
 The user normally copies the tested binary into production.
 
-Because an executable may already be running, prefer atomic replacement:
+Because an executable may already be running, prefer atomic replacement. The first activation of Version 1.15 from an older server requires one final normal restart, because older binaries do not handle `SIGHUP`. Install the binary, add the `ExecReload` line above to the unit, reload the systemd unit definition and restart once:
 
 ```sh
 sudo install -m 755 /home/tools/mcp/work/mymcp/mymcp /home/tools/mcp/mymcp.new
 sudo mv /home/tools/mcp/mymcp.new /home/tools/mcp/mymcp
+sudo systemctl daemon-reload
 sudo systemctl restart mcp.service
 ```
+
+For later releases that preserve the Version 1.15 reload contract, use atomic replacement followed by reload instead:
+
+```sh
+sudo install -m 755 /home/tools/mcp/work/mymcp/mymcp /home/tools/mcp/mymcp.new
+sudo mv /home/tools/mcp/mymcp.new /home/tools/mcp/mymcp
+sudo ln -sf mymcp /home/tools/mcp/agent_call
+sudo systemctl reload mcp.service
+```
+
+The agent_call symlink is only the local CLI entry point; it does not add another daemon or service.
+
+A reload preserves running jobs. A restart or stop deliberately terminates them. A machine reboot necessarily terminates them as well; generic automatic replay after boot is intentionally not implemented because arbitrary jobs may have external side effects.
 
 Then verify:
 
@@ -430,7 +471,7 @@ with:
 googleauth_key=<API_KEY>
 ```
 
-The file should be readable by the `mcp` service account and not by unrelated users; the recommended ownership/mode is `root:mcp` and `0640`. The API key and returned access token are never written to the MCP audit log. The `mymcp` channel name is fixed and non-secret.
+The file should be readable by the `mcp` service account and not by unrelated users; the recommended ownership/mode is `root:mcp` and `0640`. The API key and returned access token are kept in memory only and are never returned to MCP clients. The `mymcp` channel name is fixed and non-secret.
 
 Binary write sessions use private staging outside the normal work tree:
 
@@ -642,90 +683,10 @@ jobs/job_a1b2c3d4e5f6/exit_code
 
 `meta.json` contains the owning chat together with process and command metadata. Do not assume that job PID and job ID are interchangeable.
 
-
-## Request logging
-
-MCP request logging records operational tool arguments while avoiding file contents and command output.
-
-Production log file:
-
-```text
-/home/tools/mcp/mcp.log
-```
-
-It must be writable by Unix user `mcp`.
-
-Typical setup:
-
-```sh
-sudo touch /home/tools/mcp/mcp.log
-sudo chown mcp:mcp /home/tools/mcp/mcp.log
-sudo chmod 644 /home/tools/mcp/mcp.log
-```
-
-The server checks log availability at startup and is intended not to silently operate without its audit log.
-
-Examples:
-
-```text
-2026-08-12T11:20:10+0200 chat=chess client=chatgpt method=tools/call name=read_file path="chess/dtschess.c" tool_error=false rc=200 elapsed_ms=1
-2026-08-12T11:20:22+0200 chat=chess client=chatgpt method=tools/call name=write_file path="chess/step185_summary.txt" bytes=1842 tool_error=false rc=200 elapsed_ms=2
-2026-08-12T11:20:40+0200 chat=chess client=chatgpt method=tools/call name=run cwd="chess" command="gcc dtschess.c -O2 -o dtschess" exit_code=0 tool_error=false rc=200 elapsed_ms=481
-2026-08-12T11:21:03+0200 chat=chess client=chatgpt method=tools/call name=start cwd="chess" command="./dtschess --test step185" job_id=job_a1b2c3d4e5f6 tool_error=false rc=200 elapsed_ms=4
-```
-
-Tool-specific audit fields are:
-
-```text
-hello       tool_error
-read_file   path, tool_error
-write_file  path, bytes, tool_error
-list_files  path, recursive, tool_error
-read_blob   path, offset, length, tool_error
-write_blob       path, offset, base64_chars, truncate, tool_error
-drive_list       path, recursive, tool_error
-drive_stat       path, tool_error
-drive_read_blob  path, offset, length, tool_error
-drive_get_file   path, local_path, tool_error
-drive_put_file   path, local_path, tool_error
-drive_write_blob path, offset, base64_chars, truncate, commit, tool_error
-drive_mkdir      path, tool_error
-drive_rename     path, new_name, tool_error
-drive_delete     path, tool_error
-run              cwd, command, exit_code when available, tool_error
-start       cwd, command, job_id when available, tool_error
-status      job_id, tool_error
-tail        job_id, stream, lines, tool_error
-stop        job_id, force, tool_error
-jobs        limit, tool_error
-```
-
-`tool_error=true` distinguishes an MCP tool-level failure from the HTTP result code. A tool can legitimately return HTTP `rc=200` while reporting a logical tool error.
-
-Automatic MCP operations that do not belong to a specific tool chat use `chat=-` and do not have tool arguments.
-
-The audit logger deliberately does **not** record:
-
-- `write_file` content
-- data returned by `read_file`
-- stdout/stderr returned by `run`
-- stdout/stderr data returned by `tail`
-- complete JSON request/response payloads
-
-For `run` and `start`, the shell command itself is intentionally logged because it is the most important information for auditing what an autonomous client asked the server to execute. Logged quoted values are normalized to one line and limited to 2048 characters each. Quotes and backslashes are escaped.
-
-A command may itself contain a secret such as a token or password; if so, that secret can appear in the audit log. Avoid putting credentials directly on command lines. Automatic credential redaction is not implemented.
-
-Useful inspection:
-
-```sh
-tail -f /home/tools/mcp/mcp.log
-```
+Version 1.14 treats job storage as transient runtime state rather than a permanent archive. Running jobs are never removed by age. A job that is no longer running is removed, together with its metadata and stdout/stderr files, after 7 days without job-file activity. The cleanup also covers old orphaned jobs that have no `exit_code`; before removal the stored leader PID/start-time and process group are checked so a genuinely active job is preserved. Cleanup runs opportunistically when jobs are started or listed.
 
 
 ## Client identity
-
-The server can log MCP client information when supplied by the client in request metadata.
 
 The `chat` field is our own required tool argument and is not the JSON-RPC request ID.
 
@@ -804,6 +765,20 @@ The server side exposed to MCP is the general tool:
 agent_call(chat, agent?, module, action, payload?, timeout?)
 ```
 
+Version 1.16 also provides the local CLI command:
+
+```sh
+agent_call edistribuzione load_profile.month YYYY MM [MAGNITUDE]
+```
+
+For example:
+
+```sh
+agent_call edistribuzione load_profile.month 2026 09
+```
+
+The year must contain four digits and the month exactly two digits from 01 to 12. The optional magnitude accepts A+, A-, RI+, RC+, RI- or RC-; when omitted the agent default A+ is used. The CLI uses the same queue, timeout handling and result processing as the MCP tool. On success it writes the normal CSV under mymcp/tmpdata and prints only that relative CSV path. Failures return a non-zero exit status. It is intended to run locally as root or mcp because the agent spool is private to the mcp service account.
+
 `module` and `action` are small validated names. `payload` and the returned `result` are arbitrary JSON, so adding a new local capability does not require changing the transport protocol. The optional `agent` selects a specific machine; when omitted, any configured agent providing that module may claim the request. `mymcp` transports requests and results but does not know how a module is implemented. In particular, it does not receive browser cookies or authentication state from a local browser.
 
 The local agent uses long polling. It repeatedly sends an authenticated `wait` request to `/mcp`; `mymcp` holds the connection for up to 25 seconds and returns immediately when suitable work appears. After executing the request, the agent sends a `result` request to the same `/mcp` endpoint. The agent therefore requires no inbound port and works behind NAT or firewalls as long as it can reach the existing HTTPS MCP service.
@@ -826,7 +801,7 @@ For example:
 mac1 <token> test,browser,qrz,edistribuzione
 ```
 
-The configuration file is read when an agent authenticates and when `agent_call` checks module availability. Adding an agent, changing its token or changing its module list therefore does **not** require restarting `mymcp`. Tokens are never written to the MCP audit log. The existing HTTPS/Apache protection remains the outer transport protection; the per-agent token is an additional application-level identity check.
+The configuration file is read when an agent authenticates and when `agent_call` checks module availability. Adding an agent, changing its token or changing its module list therefore does **not** require restarting `mymcp`. Tokens are never returned to MCP clients. The existing HTTPS/Apache protection remains the outer transport protection; the per-agent token is an additional application-level identity check.
 
 Runtime requests use a filesystem spool, preserving the existing fork-per-connection architecture without threads, shared memory, databases, Redis or WebSockets:
 
@@ -838,92 +813,59 @@ Runtime requests use a filesystem spool, preserving the existing fork-per-connec
 
 A queued request is claimed with an atomic `rename()` into `running`. Results are written into `done`. Request IDs use the `req_<hex>` form. A request already assigned to an agent is not automatically reassigned on timeout, because actions may have side effects and automatic replay could execute them twice. If a request times out before any agent claims it, it is cancelled from the queue.
 
-The agent runtime directory is operational state and is not intended for backup. Like `/home/tools/mcp/work/jobs/`, it may contain transient or historical runtime information rather than source/project data.
+Version 1.13 keeps this spool transient without imposing an arbitrary execution limit on an agent. Each queued request stores an `expires_epoch` derived from that specific `agent_call` timeout and cannot be claimed after it expires. A request already claimed into `running` is never automatically replayed or time-expired, because the server cannot know whether an external side effect is still in progress. When `agent_call` receives a completed result, its `done` file is consumed and removed immediately. Orphaned `done` files, for example results that arrived after the caller timed out, are removed opportunistically after 1 hour.
+
+The agent runtime directory is operational state and is not intended for backup or historical retention.
 
 ### mcp_agent client
 
-Current `mcp_agent` version: **1.33**, deployed on the remote Mac.
+Production `mcp_agent` is Version **1.33**; development Version **1.37** is the unified macOS client.
 
-`mcp_agent` is the independent local client for the remote-agent transport. It is separate from `mcp_watch`; both programs may use the same Chrome CDP endpoint on `127.0.0.1:9222` when their modules require it. The client currently provides `test/echo`, `browser/read_tab`, `edistribuzione/load_profile.month` and `qrz/webcontact.add`.
+`mcp_agent` is the single macOS client. Version 1.37 combines the remote-agent transport and MCP job watcher in one executable and uses the same Chrome CDP endpoint on `127.0.0.1:9222`. The client provides `test/echo`, `browser/read_tab`, `edistribuzione/load_profile.month` and `qrz/webcontact.add`, and also watches ChatGPT conversations for completed MCP jobs.
 
-`edistribuzione/load_profile.month` retrieves one complete monthly quarter-hour load profile from an already authenticated E-Distribuzione PortaleClienti Chrome session. Payload: `year`, `month`, and optional `magnitude`; the default magnitude is `A+`. Supported magnitudes are `A+`, `A-`, `RI+`, `RC+`, `RI-` and `RC-`. The agent automatically opens the `Curve di carico` page when the authenticated browser is elsewhere in PortaleClienti, waits for the page controls, resolves the actual month/year option values exposed by the current portal UI (including zero-padded month values), synchronizes the four Aura date controls, activates `Modifica periodo` once, observes the Aura `QueryLoadProfile`/continuation response through CDP, and returns the normalized `MappaDailyLoadProfile` as days containing quarter-hour samples. The result also includes the POD read from the already loaded Aura component. A normal 31-day month therefore contains 2976 samples. When `mymcp` receives a successful result for this action, it writes the normalized samples to `mymcp/tmpdata/<POD>_YYYY_MM.csv` with columns `date,time,value`; the first sample is `00:00` and the 96th is `23:45`. The returned result includes `csv_file` when the file is written successfully. No automatic retry is performed. If the authenticated portal context is unavailable or expired, the action fails instead of replaying the request. Browser cookies and authentication material remain local to Chrome/the Mac and are never returned to the server.
+`edistribuzione/load_profile.month` retrieves one complete monthly quarter-hour load profile from an already authenticated E-Distribuzione PortaleClienti Chrome session. Payload: `year`, `month`, and optional `magnitude`; the default magnitude is `A+`. Supported magnitudes are `A+`, `A-`, `RI+`, `RC+`, `RI-` and `RC-`. The agent automatically opens the `Curve di carico` page when the authenticated browser is elsewhere in PortaleClienti, waits for the page controls, resolves the actual month/year option values exposed by the current portal UI (including zero-padded month values), synchronizes the four Aura date controls, activates `Modifica periodo` once, observes the Aura `QueryLoadProfile`/continuation response through CDP, and returns the normalized `MappaDailyLoadProfile` as days containing quarter-hour samples. The result also includes the POD read from the already loaded Aura component. A normal 31-day month therefore contains 2976 samples. When `mymcp` receives a successful result for this action, it writes the normalized samples to `mymcp/tmpdata/<POD>_YYYY_MM.csv` with columns `date,time,value`; the first sample is `00:00` and the 96th is `23:45`. The returned result includes `csv_file` when the file is written successfully. No automatic action retry is performed. If the authenticated portal context is unavailable or expired, the action fails instead of replaying the request. Result delivery itself is retried after transient network/server failures because retransmitting a completed result does not repeat the external action. Browser cookies and authentication material remain local to Chrome/the Mac and are never returned to the server.
 
 `qrz/webcontact.add` implements the authenticated QRZ operation required by qrzweb. Its payload is `callsign` plus `mycall`. The operation runs entirely inside an already authenticated QRZ Chrome context, performs an initial Web Contacts presence check, submits the QRZ add action only when needed, then performs a fresh final verification. It returns structured codes including `ALREADY_PRESENT`, `ADDED`, `NO_BROWSER`, `NO_QRZ_CONTEXT`, `NOT_AUTHENTICATED`, `PROFILE_UNAVAILABLE`, `WEB_CONTACTS_UNAVAILABLE`, `ACTION_FAILED`, `NOT_CONFIRMED`, `TEMPORARY_ERROR` and `INVALID_REQUEST`. Cookies, QRZ session identifiers, hidden form values and authentication material remain local to Chrome/the Mac and are never returned to the server. Because `mcp_agent` executes requests serially, authenticated QRZ actions are serialized by design.
 
 The QRZ operation has been validated end-to-end against a real authenticated QRZ session for the three essential cases: an existing relationship returns `ALREADY_PRESENT` without submitting an add action; a profile with historical Web Contacts but no usable authenticated action returns `WEB_CONTACTS_UNAVAILABLE`; and a real new relationship returns `ADDED` only after a fresh positive verification. Repeating the successful add returns `ALREADY_PRESENT`, confirming real idempotency after a completed action.
 
-By default it uses `https://www.mazzini.org/mcp`, agent ID `mac1`, `~/mcp/token.txt` for the existing outer MCP/Apache authorization and `~/mcp/agent.token` for the per-agent authentication. The endpoint, agent ID and both tokens may also be supplied through environment variables.
+By default it uses `https://www.mazzini.org/mcp`, agent ID `mac1`, `~/mcp/token.txt` for the existing outer MCP/Apache authorization and `~/mcp/agent.token` for the per-agent authentication. The endpoint, agent ID and both tokens may also be supplied through environment variables. `MCP_CHROME_URL` can override the default Chrome CDP base URL for diagnostics/tests; normal macOS operation uses `http://127.0.0.1:9222`.
 
-Normal mode runs continuously. Diagnostic one-request mode is:
+`mcp_agent` has one operating mode only: started without arguments, it continuously runs both the remote agent and the job watcher. `-h` and `--help` only print usage information.
 
-```sh
-./mcp_agent --once
-```
+Version 1.37 keeps the foreground process visibly alive through timestamped runtime output on stdout/stderr only; no persistent request log is created. Startup is reported immediately. Each successful agent long-poll with no work prints an `AGENT idle` heartbeat. Agent requests print arrival time, request ID, module/action, worker start, result delivery, completion and worker exit; network/result retries are reported as `ERROR`. Every watcher cycle prints a `WATCH scan` heartbeat, each selected chat, a chat job summary, every running job with elapsed time and command when available, each newly completed job with exit code, and successful or failed `check` delivery.
 
-`--once` means one **completed request**, not one long-poll cycle: idle long-poll expirations simply cause another `wait`; the process exits only after it has received, executed and returned one request.
+Version 1.37 also restores the original watcher safety rule: the Chrome target is rediscovered immediately before sending `check`. Its CDP reply handling accepts commands where the caller intentionally does not retain the JSON reply; this prevents the null-reply dereference that could terminate the unified client when a job completion triggered `Input.insertText` or `Input.dispatchKeyEvent`. The permanent regression suite executes a complete mocked Chrome WebSocket/CDP `check` sequence.
 
-The current Version 1.11 development server passes the full regression suite on a separate local port, including the end-to-end fake-agent exchange (`agent_call -> wait -> result`), wrong agent authentication and unavailable modules.
+The current Version 1.16 development server passes the full regression suite on a separate local port, including the end-to-end fake-agent exchange (`agent_call -> wait -> result`), the local E-Distribuzione CLI path through the same spool, wrong agent authentication, unavailable modules, per-request queue expiry, immediate consumption of delivered results, preservation of already claimed `running` requests, seven-day cleanup of completed/orphaned jobs while preserving active jobs, and non-destructive `SIGHUP` reload while an asynchronous job remains running.
 
 
-## mcp_watch
+### Integrated watcher
 
-Current `mcp_watch` version: **1.05**.
+Normal mcp_agent mode runs both functions continuously: remote-agent long polling and MCP job watching. Only one program has to be started on the Mac.
 
-`mcp_watch` is the local macOS helper that watches MCP asynchronous jobs and sends `check` to the corresponding open ChatGPT conversation through Chrome DevTools Protocol. It is intentionally simple and stateless on disk.
+The client reads the MCP token and agent token once at startup. The parent keeps reusable libcurl handles for the agent long-poll connection and MCP watcher queries, allowing HTTP/TLS connections to be reused across cycles. Chrome discovery uses the same 127.0.0.1:9222 instance used by the action modules.
 
-Normal use is:
+When no agent action is running there is one process. When a request arrives, mcp_agent forks one temporary worker to execute and return that request while the parent continues the watcher. The parent does not accept another agent action until the worker finishes, so external actions remain serialized. The worker exits when the request is complete.
 
-```sh
-./mcp_watch
-```
+Transient network loss, Wi-Fi changes, Mac sleep/wake, temporary MCP unavailability and stale HTTP connections are non-fatal. Long polling reconnects automatically. A completed action whose result cannot temporarily be delivered keeps retrying only the result transmission with bounded backoff; the action itself is never replayed automatically. Chrome WebSocket connections are opened when needed and rediscovered on later operations rather than assumed to survive sleep/wake.
 
-Every 60 seconds it scans the dedicated Chrome instance exposed on port `9222`, discovers all open ChatGPT conversation tabs and extracts each conversation ID from its `/c/<id>` URL. It then queries MCP `jobs` for the chat associated with each selected tab.
+The watcher scans every 60 seconds. Browser tab titles must be either:
 
-### Chat title convention
-
-The browser tab title is part of the operating convention and must be either:
-
-```text
+~~~text
 <chat>
 <chat> <number>
-```
+~~~
 
-Examples:
+The first word is the MCP chat name and the optional second word is a non-negative decimal conversation number. If several tabs have the same chat name, only the highest-numbered tab is monitored. An unnumbered tab has number 0. Two different tabs with the same highest number are ambiguous, so monitoring for that chat is suspended.
 
-```text
-collatz
-collatz 17
-collatz 18
-dts 03
-```
+Watcher state is kept only in memory. On the first observation of a conversation, already exited jobs are treated as historical and running jobs form the baseline. A later transition from running to exited, or a newly observed completion between scans, causes one check to be sent through that conversation's current Chrome CDP target. The state is then marked notified so the same completion is not sent twice.
 
-The first word is always the MCP `chat` name. The optional second word is a non-negative decimal conversation number.
+If the selected conversation changes or disappears, its old in-memory state is discarded. Work completed while a conversation was not being watched is therefore not reported retroactively. Long-running work must use MCP start because only MCP jobs have the job_id required for tracking.
 
-If only one tab exists for a chat, that tab is monitored. If several open tabs have the same chat name, **only the tab with the highest number is considered active and monitored**. This is a deliberate workflow constraint: for example, with `collatz 17` and `collatz 18` open, `mcp_watch` works only with `collatz 18`. An unnumbered tab has number `0`. Two different tabs with the same chat name and the same highest number are ambiguous; monitoring for that chat is suspended rather than choosing arbitrarily.
+There are no alternate watcher-only or agent-only operating modes. The executable always runs both functions together.
 
-When the selected highest-numbered conversation changes, its previous in-memory watcher state is discarded and the newly selected conversation starts from a fresh initial snapshot.
-
-### Job notification semantics
-
-All watcher state is kept only in memory. `mcp_watch` does not use baseline files, per-job marker files or any other persistent watcher state.
-
-When a conversation is selected for the first time, jobs already in `exited` state are treated as historical and are not notified. Jobs already `running` are remembered. After that initial snapshot, a tracked job changing from `running` to `exited`, or a new job first appearing as already `exited` between two scans, causes one `check` to be sent to the selected ChatGPT conversation. The job ID is remembered in memory so the same completion is not notified twice during that `mcp_watch` process.
-
-If a selected tab disappears, its state is discarded. If it is opened again later, it starts from a new initial snapshot. Consequently, work completed while that conversation was not being watched is intentionally not reported automatically. When resuming an old conversation, the user performs a manual `check` if needed.
-
-Long-running work must be started with MCP `start`, never with `run` plus `nohup`, `&`, `screen`, `tmux` or another detached-process mechanism. Only an MCP `start` job has the MCP `job_id` required for reliable tracking.
-
-### Diagnostic mode
-
-```sh
-./mcp_watch --query
-```
-
-This performs one discovery/query pass, shows the selected ChatGPT conversations and their running MCP jobs, and sends no `check`.
-
-### Release rule
-
-Every functional modification to `mcp_watch` increments its release number in both the source header and `MCP_CLIENT_VERSION`. The README must be updated whenever its current behavior or operating conventions change.
+There is intentionally no reboot/login autostart configuration in this project. The user starts mcp_agent manually after a reboot. Once started, it is expected to remain alive across normal network interruptions and Mac sleep/wake until explicitly terminated or the machine is rebooted.
 
 
 ## Agent strategy published by server/discover
@@ -975,14 +917,13 @@ A stricter sandbox for `run/start` was discussed but intentionally not implement
 At the time this document was written:
 
 - The C implementation is stable and in production.
-- `mymcp` Version 1.11 uses the central `googleauth` channel for Google Drive access-token acquisition and adds direct server-side Drive/workspace file transfer. Production `mcp_agent` on the remote Mac is Version 1.33. The agent provides the established `test/echo`, `browser/read_tab` and `qrz/webcontact.add` functions plus `edistribuzione/load_profile.month`; the E-Distribuzione result includes the POD, and `mymcp` stores successful monthly profiles in `mymcp/tmpdata/<POD>_YYYY_MM.csv`. Existing agent functions remain unchanged in behavior.
+- Production `mymcp` is Version 1.15. Development Version 1.16 adds the local `agent_call` CLI entry point while preserving the existing MCP agent transport and non-destructive `SIGHUP` reload contract. Production `mcp_agent` on the remote Mac is Version 1.33; development Version 1.37 unifies the remote agent and job watcher into the single `mcp_agent` executable, keeps agent actions serialized through temporary workers, reuses parent MCP connections, and automatically recovers from transient network loss and sleep/wake. The E-Distribuzione result includes the POD, and `mymcp` stores successful monthly profiles in `mymcp/tmpdata/<POD>_YYYY_MM.csv`.
 - The production service executes `/home/tools/mcp/mymcp`.
 - The Python MCP virtualenv, Python SDK checkout, old `server.py` and related MCP Python runtime files were removed.
 - The C binary uses cJSON, libcurl and libc.
-- Version 1.11 exposes 22 MCP tools, including nine native Drive tools and `agent_call`; `drive_get_file` and `drive_put_file` transfer ordinary files directly between Drive and the calling chat workspace without base64 through the client.
+- Production Version 1.15 and development Version 1.16 expose 22 MCP tools, including nine native Drive tools and `agent_call`; `drive_get_file` and `drive_put_file` transfer ordinary files directly between Drive and the calling chat workspace without base64 through the client.
 - `chat` is mandatory.
 - Job ownership by chat works.
-- Request logging is enabled at `/home/tools/mcp/mcp.log` with operational audit fields that do not log file contents or command output.
 - The development binary/source remain under `/home/tools/mcp/work/mymcp`.
 - The command manual is `/home/tools/mcp/work/GMmcp2.txt`.
 
@@ -994,7 +935,7 @@ At the time this document was written:
 3. Keep all mymcp development files inside `/home/tools/mcp/work/mymcp`.
 4. Keep unrelated projects in their own subdirectories under `/home/tools/mcp/work`.
 5. Follow the C coding style documented above.
-6. Increment the source version when implementing a real released change; do not invent a version without considering the user's versioning rule.
+6. Increment the source version for every functional change and keep one functional modification per release.
 7. Build with zero warnings before testing.
 8. Run the regression test after protocol/tool/job changes.
 9. Test new server versions on a separate port before production deployment when practical.
@@ -1003,10 +944,9 @@ At the time this document was written:
 12. Keep `GMmcp2.txt` synchronized when tool parameters or behavior change.
 13. Preserve the mandatory `chat` semantics unless the user explicitly changes the design.
 14. Preserve job ownership isolation between chats.
-15. Preserve request logging unless the user explicitly changes it.
-16. Preserve the audit policy: log operational paths/parameters and the `run/start` command (up to 2048 characters), but never log file contents, stdout/stderr or complete JSON payloads by default.
-17. Remember that `run/start` are not currently filesystem-sandboxed beyond Unix permissions and constrained working directory.
-18. Do not remove or alter unrelated project files under `work/`.
-19. If ChatGPT shows stale tools, verify the server directly before modifying code.
-20. For this conversation/project, use `chat="mymcp"` when calling tools.
-21. Never create or use hidden files or directories (names beginning with `.`); use visible names instead, including for caches, state, temporary files and backups.
+15. Do not reintroduce persistent request logging unless the user explicitly asks for it.
+16. Remember that `run/start` are not currently filesystem-sandboxed beyond Unix permissions and constrained working directory.
+17. Do not remove or alter unrelated project files under `work/`.
+18. If ChatGPT shows stale tools, verify the server directly before modifying code.
+19. For this conversation/project, use `chat="mymcp"` when calling tools.
+20. Never create or use hidden files or directories (names beginning with `.`); use visible names instead, including for caches, state, temporary files and backups.

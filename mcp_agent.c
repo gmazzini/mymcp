@@ -1,16 +1,20 @@
-// Gianluca Mazzini @2026- Version 1.33
+// Gianluca Mazzini @2026- Version 1.37
 #include <cjson/cJSON.h>
 #include <curl/curl.h>
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
-#define MCP_AGENT_VERSION "1.33"
+#define MCP_AGENT_VERSION "1.37"
 #define DEFAULT_URL "https://www.mazzini.org/mcp"
 #define DEFAULT_AGENT_ID "mac1"
 #define CHROME_HOST "http://127.0.0.1:9222"
@@ -24,6 +28,15 @@
 #define TOKEN_MAX 511
 #define AGENT_TOKEN_MAX 255
 #define AGENT_ID_MAX 64
+#define MCP_PROTOCOL "2026-07-28"
+#define MCP_CLIENT_NAME "mcp-agent"
+#define WATCH_INTERVAL 60
+#define CHAT_MAX 64
+#define CONVERSATION_MAX 128
+#define JOB_ID_MAX 63
+#define WATCH_TITLE_MAX 256
+#define JOB_RUNNING 1
+#define JOB_EXITED 2
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -33,6 +46,52 @@ struct Buffer {
   char *data;
   size_t len;
 };
+
+struct TabInfo {
+  char chat[CHAT_MAX+1];
+  char conversation_id[CONVERSATION_MAX+1];
+  char title[WATCH_TITLE_MAX];
+  int number;
+  int ambiguous;
+};
+
+struct JobState {
+  char job_id[JOB_ID_MAX+1];
+  int state;
+  int notified;
+  int seen;
+};
+
+struct ChatState {
+  char chat[CHAT_MAX+1];
+  char conversation_id[CONVERSATION_MAX+1];
+  char title[WATCH_TITLE_MAX];
+  struct JobState *jobs;
+  size_t job_count;
+  size_t job_cap;
+  int active;
+  int initialized;
+};
+
+static char g_mcp_token[TOKEN_MAX+1];
+static char g_agent_token[AGENT_TOKEN_MAX+1];
+
+static void log_line(FILE *stream,const char *component,const char *fmt,...) {
+  char stamp[32];
+  time_t now;
+  struct tm tmv;
+  va_list ap;
+
+  now=time(NULL);
+  localtime_r(&now,&tmv);
+  strftime(stamp,sizeof(stamp),"%Y-%m-%d %H:%M:%S",&tmv);
+  fprintf(stream,"[%s] %-5s ",stamp,component);
+  va_start(ap,fmt);
+  vfprintf(stream,fmt,ap);
+  va_end(ap);
+  fputc('\n',stream);
+  fflush(stream);
+}
 
 static size_t http_write(char *ptr,size_t size,size_t nmemb,void *userdata) {
   struct Buffer *b;
@@ -80,6 +139,14 @@ static const char *agent_id(void) {
   return DEFAULT_AGENT_ID;
 }
 
+static const char *chrome_host(void) {
+  const char *url;
+
+  url=getenv("MCP_CHROME_URL");
+  if(url!=NULL && url[0]!=0) return url;
+  return CHROME_HOST;
+}
+
 static int read_text_token(const char *env_name,const char *filename,char *out,size_t out_size) {
   const char *env,*home;
   char path[PATH_MAX];
@@ -110,33 +177,24 @@ static int read_text_token(const char *env_name,const char *filename,char *out,s
   return out[0]!=0?0:-1;
 }
 
-static int http_agent_request(const char *action,const char *body_text,long timeout,char **reply_out,long *http_code_out) {
-  char mcp_token[TOKEN_MAX+1],local_token[AGENT_TOKEN_MAX+1];
+static int http_agent_request(CURL *curl,const char *action,const char *body_text,long timeout,char **reply_out,long *http_code_out) {
   char auth[640],id_header[128],action_header[64],token_header[384];
   struct curl_slist *headers;
   struct Buffer reply;
-  CURL *curl;
   CURLcode rc;
   long http_code;
 
   *reply_out=NULL;
   *http_code_out=0;
-  if(read_text_token("MCP_TOKEN","token.txt",mcp_token,sizeof(mcp_token))!=0) {
-    fprintf(stderr,"cannot read MCP token\n");
-    return -1;
-  }
-  if(read_text_token("MCP_AGENT_TOKEN","agent.token",local_token,sizeof(local_token))!=0) {
-    fprintf(stderr,"cannot read agent token\n");
-    return -1;
-  }
+  if(curl==NULL) return -1;
   if(!valid_name(agent_id(),AGENT_ID_MAX)) {
     fprintf(stderr,"invalid agent id\n");
     return -1;
   }
-  if(snprintf(auth,sizeof(auth),"Authorization: Bearer %s",mcp_token)>=(int)sizeof(auth) ||
+  if(snprintf(auth,sizeof(auth),"Authorization: Bearer %s",g_mcp_token)>=(int)sizeof(auth) ||
     snprintf(id_header,sizeof(id_header),"X-MCP-Agent: %s",agent_id())>=(int)sizeof(id_header) ||
     snprintf(action_header,sizeof(action_header),"X-MCP-Agent-Action: %s",action)>=(int)sizeof(action_header) ||
-    snprintf(token_header,sizeof(token_header),"X-MCP-Agent-Token: %s",local_token)>=(int)sizeof(token_header)) return -1;
+    snprintf(token_header,sizeof(token_header),"X-MCP-Agent-Token: %s",g_agent_token)>=(int)sizeof(token_header)) return -1;
 
   headers=NULL;
   headers=curl_slist_append(headers,"Content-Type: application/json");
@@ -146,11 +204,7 @@ static int http_agent_request(const char *action,const char *body_text,long time
   headers=curl_slist_append(headers,token_header);
   reply.data=NULL;
   reply.len=0;
-  curl=curl_easy_init();
-  if(curl==NULL) {
-    curl_slist_free_all(headers);
-    return -1;
-  }
+  curl_easy_reset(curl);
   curl_easy_setopt(curl,CURLOPT_URL,agent_url());
   curl_easy_setopt(curl,CURLOPT_POST,1L);
   curl_easy_setopt(curl,CURLOPT_HTTPHEADER,headers);
@@ -161,13 +215,13 @@ static int http_agent_request(const char *action,const char *body_text,long time
   curl_easy_setopt(curl,CURLOPT_CONNECTTIMEOUT,10L);
   curl_easy_setopt(curl,CURLOPT_TIMEOUT,timeout);
   curl_easy_setopt(curl,CURLOPT_NOSIGNAL,1L);
+  curl_easy_setopt(curl,CURLOPT_TCP_KEEPALIVE,1L);
   rc=curl_easy_perform(curl);
   http_code=0;
   curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&http_code);
-  curl_easy_cleanup(curl);
   curl_slist_free_all(headers);
   if(rc!=CURLE_OK) {
-    fprintf(stderr,"HTTP error: %s\n",curl_easy_strerror(rc));
+    log_line(stderr,"ERROR","HTTP %s",curl_easy_strerror(rc));
     free(reply.data);
     return -1;
   }
@@ -208,7 +262,7 @@ static int find_tab(const char *wanted_title,char **ws_url,char **tab_url) {
 
   *ws_url=NULL;
   *tab_url=NULL;
-  if(snprintf(endpoint,sizeof(endpoint),"%s/json/list",CHROME_HOST)>=(int)sizeof(endpoint)) return -1;
+  if(snprintf(endpoint,sizeof(endpoint),"%s/json/list",chrome_host())>=(int)sizeof(endpoint)) return -1;
   if(chrome_get(endpoint,&body)!=0) return -2;
   root=cJSON_Parse(body.data!=NULL?body.data:"");
   free(body.data);
@@ -258,7 +312,7 @@ static int find_qrz_tab(char **ws_url) {
   int i,n;
 
   *ws_url=NULL;
-  if(snprintf(endpoint,sizeof(endpoint),"%s/json/list",CHROME_HOST)>=(int)sizeof(endpoint)) return -1;
+  if(snprintf(endpoint,sizeof(endpoint),"%s/json/list",chrome_host())>=(int)sizeof(endpoint)) return -1;
   if(chrome_get(endpoint,&body)!=0) return -2;
   root=cJSON_Parse(body.data!=NULL?body.data:"");
   free(body.data);
@@ -404,7 +458,8 @@ static int cdp_call(CURL *ws,int id,const char *method,cJSON *params,cJSON **rep
       cJSON_Delete(root);
       return -1;
     }
-    *reply=root;
+    if(reply!=NULL) *reply=root;
+    else cJSON_Delete(root);
     return 0;
   }
 }
@@ -514,7 +569,7 @@ static int edistribuzione_find_tab(char **ws_url) {
   *ws_url=NULL;
   prefix="https://private.e-distribuzione.it/PortaleClienti";
   prefix_len=strlen(prefix);
-  if(snprintf(endpoint,sizeof(endpoint),"%s/json/list",CHROME_HOST)>=(int)sizeof(endpoint)) return -1;
+  if(snprintf(endpoint,sizeof(endpoint),"%s/json/list",chrome_host())>=(int)sizeof(endpoint)) return -1;
   if(chrome_get(endpoint,&body)!=0) return -2;
   root=cJSON_Parse(body.data!=NULL?body.data:"");
   free(body.data);
@@ -1413,10 +1468,11 @@ static cJSON *dispatch_request(const char *module,const char *action,cJSON *payl
   return NULL;
 }
 
-static int send_result(const char *request_id,cJSON *result,const char *error_text) {
+static int send_result(CURL *curl,const char *request_id,cJSON *result,const char *error_text) {
   cJSON *root;
   char *body,*reply;
   long http_code;
+  unsigned int retry_delay;
   int rc;
 
   root=cJSON_CreateObject();
@@ -1433,23 +1489,642 @@ static int send_result(const char *request_id,cJSON *result,const char *error_te
   body=cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
   if(body==NULL) return -1;
-  reply=NULL;
-  rc=http_agent_request("result",body,HTTP_RESULT_TIMEOUT,&reply,&http_code);
-  free(body);
-  if(rc!=0) return -1;
-  if(http_code!=200) {
-    fprintf(stderr,"result rejected HTTP %ld: %s\n",http_code,reply!=NULL?reply:"");
+  retry_delay=2;
+  for(;;) {
+    reply=NULL;
+    rc=http_agent_request(curl,"result",body,HTTP_RESULT_TIMEOUT,&reply,&http_code);
+    if(rc==0 && http_code==200) {
+      log_line(stdout,"AGENT","result delivered request=%s",request_id);
+      free(reply);
+      free(body);
+      return 0;
+    }
+    if(rc==0 && http_code<500) {
+      log_line(stderr,"ERROR","agent result rejected request=%s HTTP=%ld detail=%s",request_id,http_code,reply!=NULL?reply:"");
+      free(reply);
+      free(body);
+      return -1;
+    }
+    if(rc==0)
+      log_line(stderr,"ERROR","agent result temporary HTTP=%ld request=%s retry=%us",http_code,request_id,retry_delay);
+    else
+      log_line(stderr,"ERROR","agent result network failure request=%s retry=%us",request_id,retry_delay);
     free(reply);
-    return -1;
+    sleep(retry_delay);
+    if(retry_delay<10) {
+      retry_delay*=2;
+      if(retry_delay>10) retry_delay=10;
+    }
   }
-  free(reply);
+}
+
+static int valid_conversation_id(const char *s) {
+  size_t i,n;
+
+  if(s==NULL) return 0;
+  n=strlen(s);
+  if(n<8 || n>CONVERSATION_MAX) return 0;
+  for(i=0;i<n;i++) {
+    if(!isalnum((unsigned char)s[i]) && s[i]!='-' && s[i]!='_') return 0;
+  }
+  return 1;
+}
+
+static cJSON *make_jobs_request(const char *chat) {
+  cJSON *root,*params,*meta,*info,*args;
+
+  root=cJSON_CreateObject();
+  if(root==NULL) return NULL;
+  cJSON_AddStringToObject(root,"jsonrpc","2.0");
+  cJSON_AddNumberToObject(root,"id",1);
+  cJSON_AddStringToObject(root,"method","tools/call");
+  params=cJSON_AddObjectToObject(root,"params");
+  meta=cJSON_AddObjectToObject(params,"_meta");
+  cJSON_AddStringToObject(meta,"io.modelcontextprotocol/protocolVersion",MCP_PROTOCOL);
+  cJSON_AddObjectToObject(meta,"io.modelcontextprotocol/clientCapabilities");
+  info=cJSON_AddObjectToObject(meta,"io.modelcontextprotocol/clientInfo");
+  cJSON_AddStringToObject(info,"name",MCP_CLIENT_NAME);
+  cJSON_AddStringToObject(info,"version",MCP_AGENT_VERSION);
+  cJSON_AddStringToObject(params,"name","jobs");
+  args=cJSON_AddObjectToObject(params,"arguments");
+  cJSON_AddStringToObject(args,"chat",chat);
+  cJSON_AddNumberToObject(args,"limit",1000);
+  return root;
+}
+
+static cJSON *query_jobs(CURL *curl,const char *chat) {
+  char auth[640];
+  struct Buffer body;
+  struct curl_slist *headers;
+  CURLcode curl_rc;
+  cJSON *req,*reply,*result,*content;
+  char *json;
+  long http_code;
+
+  req=make_jobs_request(chat);
+  if(req==NULL) return NULL;
+  json=cJSON_PrintUnformatted(req);
+  cJSON_Delete(req);
+  if(json==NULL) return NULL;
+  if(snprintf(auth,sizeof(auth),"Authorization: Bearer %s",g_mcp_token)>=(int)sizeof(auth)) {
+    free(json);
+    return NULL;
+  }
+  body.data=NULL;
+  body.len=0;
+  headers=NULL;
+  headers=curl_slist_append(headers,"Content-Type: application/json");
+  headers=curl_slist_append(headers,"MCP-Protocol-Version: " MCP_PROTOCOL);
+  headers=curl_slist_append(headers,"Mcp-Method: tools/call");
+  headers=curl_slist_append(headers,"Mcp-Name: jobs");
+  headers=curl_slist_append(headers,auth);
+  curl_easy_reset(curl);
+  curl_easy_setopt(curl,CURLOPT_URL,agent_url());
+  curl_easy_setopt(curl,CURLOPT_POST,1L);
+  curl_easy_setopt(curl,CURLOPT_HTTPHEADER,headers);
+  curl_easy_setopt(curl,CURLOPT_POSTFIELDS,json);
+  curl_easy_setopt(curl,CURLOPT_POSTFIELDSIZE,(long)strlen(json));
+  curl_easy_setopt(curl,CURLOPT_WRITEFUNCTION,http_write);
+  curl_easy_setopt(curl,CURLOPT_WRITEDATA,&body);
+  curl_easy_setopt(curl,CURLOPT_CONNECTTIMEOUT_MS,10000L);
+  curl_easy_setopt(curl,CURLOPT_TIMEOUT_MS,10000L);
+  curl_easy_setopt(curl,CURLOPT_NOSIGNAL,1L);
+  curl_easy_setopt(curl,CURLOPT_TCP_KEEPALIVE,1L);
+  curl_rc=curl_easy_perform(curl);
+  http_code=0;
+  curl_easy_getinfo(curl,CURLINFO_RESPONSE_CODE,&http_code);
+  curl_slist_free_all(headers);
+  free(json);
+  if(curl_rc!=CURLE_OK || http_code!=200) {
+    if(curl_rc!=CURLE_OK)
+      log_line(stderr,"ERROR","watch jobs HTTP chat=%s error=%s",chat,curl_easy_strerror(curl_rc));
+    else
+      log_line(stderr,"ERROR","watch jobs HTTP chat=%s status=%ld",chat,http_code);
+    free(body.data);
+    return NULL;
+  }
+  reply=cJSON_Parse(body.data!=NULL?body.data:"");
+  free(body.data);
+  if(!cJSON_IsObject(reply)) {
+    cJSON_Delete(reply);
+    return NULL;
+  }
+  result=cJSON_GetObjectItemCaseSensitive(reply,"result");
+  content=cJSON_IsObject(result)?cJSON_GetObjectItemCaseSensitive(result,"structuredContent"):NULL;
+  if(!cJSON_IsArray(content)) {
+    cJSON_Delete(reply);
+    return NULL;
+  }
+  cJSON_DetachItemViaPointer(result,content);
+  cJSON_Delete(reply);
+  return content;
+}
+
+static int extract_chat(const char *title,char *out,size_t out_size,int *number) {
+  const char *p,*end;
+  char *number_end;
+  long value;
+  size_t n;
+
+  if(title==NULL || number==NULL || out_size<2) return -1;
+  p=title;
+  for(;*p!=0 && isspace((unsigned char)*p);p++);
+  n=0;
+  for(;p[n]!=0 && !isspace((unsigned char)p[n]);n++);
+  if(n==0 || n>=out_size) return -1;
+  memcpy(out,p,n);
+  out[n]=0;
+  if(!valid_name(out,CHAT_MAX)) return -1;
+  p+=n;
+  for(;*p!=0 && isspace((unsigned char)*p);p++);
+  if(*p==0) {
+    *number=0;
+    return 0;
+  }
+  value=strtol(p,&number_end,10);
+  if(number_end==p || value<0 || value>INT_MAX) return -1;
+  end=number_end;
+  for(;*end!=0 && isspace((unsigned char)*end);end++);
+  if(*end!=0) return -1;
+  *number=(int)value;
   return 0;
 }
 
-static int process_wait_reply(const char *text) {
+static int extract_conversation_id(const char *url,char *out,size_t out_size) {
+  const char *p;
+  size_t n;
+
+  if(url==NULL || out==NULL || out_size<2) return -1;
+  if(strstr(url,"chatgpt.com/")==NULL && strstr(url,"chat.openai.com/")==NULL) return -1;
+  p=strstr(url,"/c/");
+  if(p==NULL) return -1;
+  p+=3;
+  n=0;
+  for(;p[n]!=0 && p[n]!='?' && p[n]!='#' && p[n]!='/';n++);
+  if(n==0 || n>=out_size) return -1;
+  memcpy(out,p,n);
+  out[n]=0;
+  return valid_conversation_id(out)?0:-1;
+}
+
+static int add_tab(struct TabInfo **tabs,size_t *count,size_t *cap,const char *chat,
+    const char *conversation_id,const char *title,int number) {
+  struct TabInfo *p;
+  size_t i,new_cap;
+
+  if(strlen(title)>=WATCH_TITLE_MAX) return -1;
+  for(i=0;i<*count;i++) {
+    if(strcmp((*tabs)[i].chat,chat)!=0) continue;
+    if(number>(*tabs)[i].number) {
+      snprintf((*tabs)[i].conversation_id,sizeof((*tabs)[i].conversation_id),"%s",conversation_id);
+      snprintf((*tabs)[i].title,sizeof((*tabs)[i].title),"%s",title);
+      (*tabs)[i].number=number;
+      (*tabs)[i].ambiguous=0;
+    } else if(number==(*tabs)[i].number && strcmp((*tabs)[i].conversation_id,conversation_id)!=0)
+      (*tabs)[i].ambiguous=1;
+    return 0;
+  }
+  if(*count==*cap) {
+    new_cap=*cap!=0?*cap*2:8;
+    p=(struct TabInfo *)realloc(*tabs,new_cap*sizeof(**tabs));
+    if(p==NULL) return -1;
+    *tabs=p;
+    *cap=new_cap;
+  }
+  snprintf((*tabs)[*count].chat,sizeof((*tabs)[*count].chat),"%s",chat);
+  snprintf((*tabs)[*count].conversation_id,sizeof((*tabs)[*count].conversation_id),"%s",conversation_id);
+  snprintf((*tabs)[*count].title,sizeof((*tabs)[*count].title),"%s",title);
+  (*tabs)[*count].number=number;
+  (*tabs)[*count].ambiguous=0;
+  (*count)++;
+  return 0;
+}
+
+static int discover_tabs(struct TabInfo **tabs,size_t *count) {
+  struct Buffer body;
+  cJSON *root,*item,*type,*title,*url,*ws;
+  char endpoint[256],chat[CHAT_MAX+1],conversation_id[CONVERSATION_MAX+1];
+  size_t cap;
+  int i,n,number;
+
+  *tabs=NULL;
+  *count=0;
+  cap=0;
+  if(snprintf(endpoint,sizeof(endpoint),"%s/json/list",chrome_host())>=(int)sizeof(endpoint)) return -1;
+  if(chrome_get(endpoint,&body)!=0) return -1;
+  root=cJSON_Parse(body.data!=NULL?body.data:"");
+  free(body.data);
+  if(!cJSON_IsArray(root)) {
+    cJSON_Delete(root);
+    return -1;
+  }
+  n=cJSON_GetArraySize(root);
+  for(i=0;i<n;i++) {
+    item=cJSON_GetArrayItem(root,i);
+    type=cJSON_GetObjectItemCaseSensitive(item,"type");
+    title=cJSON_GetObjectItemCaseSensitive(item,"title");
+    url=cJSON_GetObjectItemCaseSensitive(item,"url");
+    ws=cJSON_GetObjectItemCaseSensitive(item,"webSocketDebuggerUrl");
+    if(!cJSON_IsString(type) || strcmp(type->valuestring,"page")!=0) continue;
+    if(!cJSON_IsString(title) || !cJSON_IsString(url) || !cJSON_IsString(ws)) continue;
+    if(extract_chat(title->valuestring,chat,sizeof(chat),&number)!=0) continue;
+    if(extract_conversation_id(url->valuestring,conversation_id,sizeof(conversation_id))!=0) continue;
+    if(add_tab(tabs,count,&cap,chat,conversation_id,title->valuestring,number)!=0) {
+      free(*tabs);
+      *tabs=NULL;
+      *count=0;
+      cJSON_Delete(root);
+      return -1;
+    }
+  }
+  cJSON_Delete(root);
+  return 0;
+}
+
+static int watch_candidate(cJSON *item,const char *conversation_id) {
+  cJSON *type,*url,*ws;
+  char pattern[160];
+
+  type=cJSON_GetObjectItemCaseSensitive(item,"type");
+  url=cJSON_GetObjectItemCaseSensitive(item,"url");
+  ws=cJSON_GetObjectItemCaseSensitive(item,"webSocketDebuggerUrl");
+  if(!cJSON_IsString(type) || strcmp(type->valuestring,"page")!=0) return 0;
+  if(!cJSON_IsString(url) || !cJSON_IsString(ws)) return 0;
+  if(snprintf(pattern,sizeof(pattern),"/c/%s",conversation_id)>=(int)sizeof(pattern)) return 0;
+  return strstr(url->valuestring,pattern)!=NULL;
+}
+
+static int watch_find_target(const char *conversation_id,char **ws_url,char **title) {
+  struct Buffer body;
+  cJSON *root,*item,*cjs_title,*cjs_ws;
+  char endpoint[256];
+  int i,n,count;
+
+  *ws_url=NULL;
+  *title=NULL;
+  if(snprintf(endpoint,sizeof(endpoint),"%s/json/list",chrome_host())>=(int)sizeof(endpoint)) return -1;
+  if(chrome_get(endpoint,&body)!=0) return -1;
+  root=cJSON_Parse(body.data!=NULL?body.data:"");
+  free(body.data);
+  if(!cJSON_IsArray(root)) {
+    cJSON_Delete(root);
+    return -1;
+  }
+  n=cJSON_GetArraySize(root);
+  count=0;
+  for(i=0;i<n;i++) {
+    item=cJSON_GetArrayItem(root,i);
+    if(watch_candidate(item,conversation_id)) count++;
+  }
+  if(count!=1) {
+    cJSON_Delete(root);
+    return -1;
+  }
+  for(i=0;i<n;i++) {
+    item=cJSON_GetArrayItem(root,i);
+    if(!watch_candidate(item,conversation_id)) continue;
+    cjs_title=cJSON_GetObjectItemCaseSensitive(item,"title");
+    cjs_ws=cJSON_GetObjectItemCaseSensitive(item,"webSocketDebuggerUrl");
+    if(!cJSON_IsString(cjs_title) || !cJSON_IsString(cjs_ws)) break;
+    *ws_url=strdup(cjs_ws->valuestring);
+    *title=strdup(cjs_title->valuestring);
+    cJSON_Delete(root);
+    if(*ws_url==NULL || *title==NULL) {
+      free(*ws_url);
+      free(*title);
+      *ws_url=NULL;
+      *title=NULL;
+      return -1;
+    }
+    return 0;
+  }
+  cJSON_Delete(root);
+  return -1;
+}
+
+static const char *watch_eval_string(cJSON *reply) {
+  cJSON *value;
+
+  value=cdp_eval_value(reply);
+  return cJSON_IsString(value)?value->valuestring:NULL;
+}
+
+static int send_check(const struct ChatState *state) {
+  const char *expr,*value;
+  cJSON *params,*reply;
+  char *ws_url,*title;
+  CURL *ws;
+  CURLcode curl_rc;
+  int id,result;
+
+  ws_url=NULL;
+  title=NULL;
+  ws=NULL;
+  result=-1;
+  if(watch_find_target(state->conversation_id,&ws_url,&title)!=0) {
+    log_line(stderr,"ERROR","watch target disappeared chat=%s conversation=%s",state->chat,state->conversation_id);
+    goto done;
+  }
+  ws=curl_easy_init();
+  if(ws==NULL) goto done;
+  curl_easy_setopt(ws,CURLOPT_URL,ws_url);
+  curl_easy_setopt(ws,CURLOPT_CONNECT_ONLY,2L);
+  curl_easy_setopt(ws,CURLOPT_CONNECTTIMEOUT_MS,3000L);
+  curl_easy_setopt(ws,CURLOPT_NOSIGNAL,1L);
+  curl_rc=curl_easy_perform(ws);
+  if(curl_rc!=CURLE_OK) {
+    log_line(stderr,"ERROR","watch WebSocket connect chat=%s error=%s",state->chat,curl_easy_strerror(curl_rc));
+    goto done;
+  }
+  id=1;
+  expr="(() => {"
+       "const visible=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0;};"
+       "const e=document.querySelector('#prompt-textarea')||"
+       "[...document.querySelectorAll('textarea,[contenteditable=\"true\"]')].find(visible);"
+       "if(!e)return 'NO_COMPOSER';"
+       "if(e.disabled||e.getAttribute('aria-disabled')==='true')return 'DISABLED';"
+       "const t=('value' in e?e.value:e.innerText).trim();"
+       "if(t)return 'BUSY';"
+       "e.focus();return document.activeElement===e?'READY':'NO_FOCUS';"
+       "})()";
+  params=cJSON_CreateObject();
+  cJSON_AddStringToObject(params,"expression",expr);
+  cJSON_AddBoolToObject(params,"returnByValue",1);
+  cJSON_AddBoolToObject(params,"userGesture",1);
+  reply=NULL;
+  if(cdp_call(ws,id++,"Runtime.evaluate",params,&reply)!=0) {
+    log_line(stderr,"ERROR","watch CDP Runtime.evaluate failed chat=%s",state->chat);
+    goto done;
+  }
+  value=watch_eval_string(reply);
+  if(value==NULL || strcmp(value,"READY")!=0) {
+    log_line(stderr,"ERROR","watch composer not ready chat=%s state=%s",state->chat,value!=NULL?value:"invalid");
+    cJSON_Delete(reply);
+    goto done;
+  }
+  cJSON_Delete(reply);
+  params=cJSON_CreateObject();
+  cJSON_AddStringToObject(params,"text","check");
+  if(cdp_call(ws,id++,"Input.insertText",params,NULL)!=0) {
+    log_line(stderr,"ERROR","watch CDP Input.insertText failed chat=%s",state->chat);
+    goto done;
+  }
+  usleep(100000);
+  params=cJSON_CreateObject();
+  cJSON_AddStringToObject(params,"type","rawKeyDown");
+  cJSON_AddStringToObject(params,"key","Enter");
+  cJSON_AddStringToObject(params,"code","Enter");
+  cJSON_AddNumberToObject(params,"windowsVirtualKeyCode",13);
+  cJSON_AddNumberToObject(params,"nativeVirtualKeyCode",13);
+  if(cdp_call(ws,id++,"Input.dispatchKeyEvent",params,NULL)!=0) {
+    log_line(stderr,"ERROR","watch CDP keyDown failed chat=%s",state->chat);
+    goto done;
+  }
+  params=cJSON_CreateObject();
+  cJSON_AddStringToObject(params,"type","keyUp");
+  cJSON_AddStringToObject(params,"key","Enter");
+  cJSON_AddStringToObject(params,"code","Enter");
+  cJSON_AddNumberToObject(params,"windowsVirtualKeyCode",13);
+  cJSON_AddNumberToObject(params,"nativeVirtualKeyCode",13);
+  if(cdp_call(ws,id++,"Input.dispatchKeyEvent",params,NULL)!=0) {
+    log_line(stderr,"ERROR","watch CDP keyUp failed chat=%s",state->chat);
+    goto done;
+  }
+  log_line(stdout,"WATCH","check sent chat=%s tab=%s",state->chat,title);
+  result=0;
+done:
+  if(ws!=NULL) curl_easy_cleanup(ws);
+  free(ws_url);
+  free(title);
+  return result;
+}
+
+static struct ChatState *find_chat_state(struct ChatState *states,size_t count,const char *chat) {
+  size_t i;
+
+  for(i=0;i<count;i++) if(strcmp(states[i].chat,chat)==0) return &states[i];
+  return NULL;
+}
+
+static struct ChatState *add_chat_state(struct ChatState **states,size_t *count,size_t *cap,
+    const struct TabInfo *tab) {
+  struct ChatState *p,*state;
+  size_t new_cap;
+
+  if(*count==*cap) {
+    new_cap=*cap!=0?*cap*2:8;
+    p=(struct ChatState *)realloc(*states,new_cap*sizeof(**states));
+    if(p==NULL) return NULL;
+    *states=p;
+    *cap=new_cap;
+  }
+  state=&(*states)[*count];
+  memset(state,0,sizeof(*state));
+  snprintf(state->chat,sizeof(state->chat),"%s",tab->chat);
+  snprintf(state->conversation_id,sizeof(state->conversation_id),"%s",tab->conversation_id);
+  snprintf(state->title,sizeof(state->title),"%s",tab->title);
+  state->active=1;
+  (*count)++;
+  return state;
+}
+
+static struct JobState *find_job(struct ChatState *state,const char *job_id) {
+  size_t i;
+
+  for(i=0;i<state->job_count;i++)
+    if(strcmp(state->jobs[i].job_id,job_id)==0) return &state->jobs[i];
+  return NULL;
+}
+
+static struct JobState *add_job(struct ChatState *state,const char *job_id) {
+  struct JobState *p,*job;
+  size_t new_cap;
+
+  if(state->job_count==state->job_cap) {
+    new_cap=state->job_cap!=0?state->job_cap*2:16;
+    p=(struct JobState *)realloc(state->jobs,new_cap*sizeof(*state->jobs));
+    if(p==NULL) return NULL;
+    state->jobs=p;
+    state->job_cap=new_cap;
+  }
+  job=&state->jobs[state->job_count++];
+  memset(job,0,sizeof(*job));
+  snprintf(job->job_id,sizeof(job->job_id),"%s",job_id);
+  return job;
+}
+
+static void format_elapsed(cJSON *elapsed,char *out,size_t out_size) {
+  long total;
+  int days,hours,minutes,seconds;
+
+  total=cJSON_IsNumber(elapsed)?(long)elapsed->valuedouble:0;
+  if(total<0) total=0;
+  days=(int)(total/86400L);
+  hours=(int)((total%86400L)/3600L);
+  minutes=(int)((total%3600L)/60L);
+  seconds=(int)(total%60L);
+  if(days>0) snprintf(out,out_size,"%dd %02d:%02d:%02d",days,hours,minutes,seconds);
+  else snprintf(out,out_size,"%02d:%02d:%02d",hours,minutes,seconds);
+}
+
+static int update_jobs(struct ChatState *state,cJSON *jobs,int initial) {
+  cJSON *item,*job_id,*job_state,*elapsed,*command,*exit_code;
+  struct JobState *job;
+  char elapsed_text[32];
+  size_t i,j;
+  int n,state_code,pending,running,exited,exit_value,completed_now;
+
+  for(i=0;i<state->job_count;i++) state->jobs[i].seen=0;
+  running=0;
+  exited=0;
+  n=cJSON_GetArraySize(jobs);
+  for(j=0;j<(size_t)n;j++) {
+    item=cJSON_GetArrayItem(jobs,(int)j);
+    job_id=cJSON_GetObjectItemCaseSensitive(item,"job_id");
+    job_state=cJSON_GetObjectItemCaseSensitive(item,"state");
+    if(!cJSON_IsString(job_id) || !cJSON_IsString(job_state)) continue;
+    if(strcmp(job_state->valuestring,"running")==0) state_code=JOB_RUNNING;
+    else if(strcmp(job_state->valuestring,"exited")==0) state_code=JOB_EXITED;
+    else continue;
+    job=find_job(state,job_id->valuestring);
+    completed_now=0;
+    if(job==NULL) {
+      job=add_job(state,job_id->valuestring);
+      if(job==NULL) return -1;
+      job->state=state_code;
+      job->notified=(initial && state_code==JOB_EXITED)?1:0;
+      if(!initial && state_code==JOB_EXITED) completed_now=1;
+    } else if(job->state==JOB_RUNNING && state_code==JOB_EXITED) {
+      job->state=JOB_EXITED;
+      job->notified=0;
+      completed_now=1;
+    } else {
+      job->state=state_code;
+    }
+    job->seen=1;
+    if(state_code==JOB_RUNNING) {
+      running++;
+      elapsed=cJSON_GetObjectItemCaseSensitive(item,"elapsed_seconds");
+      command=cJSON_GetObjectItemCaseSensitive(item,"command");
+      format_elapsed(elapsed,elapsed_text,sizeof(elapsed_text));
+      if(cJSON_IsString(command))
+        log_line(stdout,"JOB","chat=%s running id=%s elapsed=%s command=%s",state->chat,job_id->valuestring,elapsed_text,command->valuestring);
+      else
+        log_line(stdout,"JOB","chat=%s running id=%s elapsed=%s",state->chat,job_id->valuestring,elapsed_text);
+    } else {
+      exited++;
+      if(completed_now) {
+        exit_code=cJSON_GetObjectItemCaseSensitive(item,"exit_code");
+        exit_value=cJSON_IsNumber(exit_code)?exit_code->valueint:0;
+        log_line(stdout,"JOB","chat=%s completed id=%s exit=%d",state->chat,job_id->valuestring,exit_value);
+      }
+    }
+  }
+  for(i=0;i<state->job_count;) {
+    if(!state->jobs[i].seen && state->jobs[i].state==JOB_EXITED && state->jobs[i].notified) {
+      state->jobs[i]=state->jobs[state->job_count-1];
+      state->job_count--;
+    } else {
+      i++;
+    }
+  }
+  pending=0;
+  for(i=0;i<state->job_count;i++)
+    if(state->jobs[i].state==JOB_EXITED && !state->jobs[i].notified) pending++;
+  log_line(stdout,"WATCH","chat=%s jobs=%d running=%d exited=%d pending=%d%s",state->chat,n,running,exited,pending,initial?" baseline":"");
+  if(initial || pending==0) return 0;
+  if(send_check(state)!=0) {
+    log_line(stderr,"ERROR","watch check failed chat=%s",state->chat);
+    return 0;
+  }
+  for(i=0;i<state->job_count;i++)
+    if(state->jobs[i].state==JOB_EXITED && !state->jobs[i].notified) state->jobs[i].notified=1;
+  return 0;
+}
+
+static void remove_inactive_states(struct ChatState *states,size_t *count) {
+  size_t i;
+
+  for(i=0;i<*count;) {
+    if(states[i].active) {
+      i++;
+      continue;
+    }
+    free(states[i].jobs);
+    states[i]=states[*count-1];
+    (*count)--;
+  }
+}
+
+static int watch_scan(CURL *curl,struct ChatState **states,size_t *state_count,size_t *state_cap,int notify) {
+  struct TabInfo *tabs;
+  struct ChatState *state;
+  cJSON *jobs;
+  size_t tab_count,i;
+  int initial;
+
+  if(discover_tabs(&tabs,&tab_count)!=0) {
+    log_line(stderr,"ERROR","watch scan: Chrome discovery failed");
+    return -1;
+  }
+  log_line(stdout,"WATCH","scan tabs=%lu",(unsigned long)tab_count);
+  for(i=0;i<*state_count;i++) (*states)[i].active=0;
+  for(i=0;i<tab_count;i++) {
+    state=find_chat_state(*states,*state_count,tabs[i].chat);
+    if(state==NULL) {
+      state=add_chat_state(states,state_count,state_cap,&tabs[i]);
+      if(state==NULL) {
+        free(tabs);
+        return -1;
+      }
+    }
+    state->active=1;
+    log_line(stdout,"WATCH","chat=%s tab=%s",tabs[i].chat,tabs[i].title);
+    if(tabs[i].ambiguous) {
+      log_line(stderr,"ERROR","watch chat=%s ambiguous highest-numbered tab",tabs[i].chat);
+      free(state->jobs);
+      state->jobs=NULL;
+      state->job_count=0;
+      state->job_cap=0;
+      state->initialized=0;
+      continue;
+    }
+    if(state->initialized && strcmp(state->conversation_id,tabs[i].conversation_id)!=0) {
+      free(state->jobs);
+      state->jobs=NULL;
+      state->job_count=0;
+      state->job_cap=0;
+      state->initialized=0;
+    }
+    snprintf(state->conversation_id,sizeof(state->conversation_id),"%s",tabs[i].conversation_id);
+    snprintf(state->title,sizeof(state->title),"%s",tabs[i].title);
+    jobs=query_jobs(curl,state->chat);
+    if(jobs==NULL) {
+      log_line(stderr,"ERROR","watch jobs query failed chat=%s",state->chat);
+      free(tabs);
+      return -1;
+    }
+    initial=!state->initialized;
+    if(!notify) initial=1;
+    if(update_jobs(state,jobs,initial)!=0) {
+      cJSON_Delete(jobs);
+      free(tabs);
+      return -1;
+    }
+    if(notify && !state->initialized) state->initialized=1;
+    cJSON_Delete(jobs);
+  }
+  if(notify) remove_inactive_states(*states,state_count);
+  free(tabs);
+  return 0;
+}
+
+static int process_wait_reply(const char *text,pid_t *worker_pid) {
   cJSON *root,*item,*payload,*result;
   const char *status,*request_id,*module,*action;
   char *error_text;
+  CURL *worker_curl;
+  pid_t pid;
   int rc;
 
   root=cJSON_Parse(text!=NULL?text:"");
@@ -1461,6 +2136,7 @@ static int process_wait_reply(const char *text) {
   item=cJSON_GetObjectItemCaseSensitive(root,"status");
   status=cJSON_IsString(item)?item->valuestring:NULL;
   if(status!=NULL && strcmp(status,"idle")==0) {
+    log_line(stdout,"AGENT","idle");
     cJSON_Delete(root);
     return 0;
   }
@@ -1481,75 +2157,134 @@ static int process_wait_reply(const char *text) {
     fprintf(stderr,"incomplete agent request\n");
     return -1;
   }
-  printf("request %s module=%s action=%s\n",request_id,module,action);
-  fflush(stdout);
-  error_text=NULL;
-  result=dispatch_request(module,action,payload,&error_text);
-  rc=send_result(request_id,result,error_text);
-  free(error_text);
-  if(rc==0) {
-    printf("completed %s\n",request_id);
-    fflush(stdout);
+  log_line(stdout,"AGENT","received request=%s module=%s action=%s",request_id,module,action);
+  pid=fork();
+  if(pid<0) {
+    cJSON_Delete(root);
+    fprintf(stderr,"cannot fork agent worker: %s\n",strerror(errno));
+    return -1;
   }
+  if(pid==0) {
+    worker_curl=curl_easy_init();
+    if(worker_curl==NULL) _exit(1);
+    error_text=NULL;
+    result=dispatch_request(module,action,payload,&error_text);
+    rc=send_result(worker_curl,request_id,result,error_text);
+    free(error_text);
+    curl_easy_cleanup(worker_curl);
+    if(rc==0)
+      log_line(stdout,"AGENT","completed request=%s",request_id);
+    else
+      log_line(stderr,"ERROR","agent request failed request=%s",request_id);
+    cJSON_Delete(root);
+    _exit(rc==0?0:1);
+  }
+  log_line(stdout,"AGENT","worker started request=%s pid=%ld",request_id,(long)pid);
   cJSON_Delete(root);
-  return rc==0?1:-1;
+  *worker_pid=pid;
+  return 1;
 }
 
-static int wait_once(void) {
+static int agent_wait(CURL *curl,pid_t *worker_pid) {
   char *reply;
   long http_code;
   int rc;
 
   reply=NULL;
-  rc=http_agent_request("wait","{}",HTTP_WAIT_TIMEOUT,&reply,&http_code);
-  if(rc!=0) return -1;
+  rc=http_agent_request(curl,"wait","{}",HTTP_WAIT_TIMEOUT,&reply,&http_code);
+  if(rc!=0) {
+    log_line(stderr,"ERROR","agent wait network failure");
+    return -1;
+  }
   if(http_code!=200) {
-    fprintf(stderr,"wait rejected HTTP %ld: %s\n",http_code,reply!=NULL?reply:"");
+    log_line(stderr,"ERROR","agent wait rejected HTTP=%ld detail=%s",http_code,reply!=NULL?reply:"");
     free(reply);
     return -1;
   }
-  rc=process_wait_reply(reply);
+  rc=process_wait_reply(reply,worker_pid);
   free(reply);
   return rc;
 }
 
 static void usage(const char *prog) {
   printf("mcp_agent %s\n",MCP_AGENT_VERSION);
-  printf("usage: %s [--once]\n",prog);
-  printf("--once waits until one request is completed, then exits\n");
+  printf("usage: %s\n",prog);
+  printf("runs the remote agent and the ChatGPT job watcher together\n");
+  printf("watch interval: %d seconds\n",WATCH_INTERVAL);
   printf("modules: test/echo, browser/read_tab, edistribuzione/load_profile.month, qrz/webcontact.add\n");
   printf("browser/read_tab reads at most %d characters from document.body.innerText\n",BROWSER_TEXT_MAX);
   printf("default endpoint: %s\n",DEFAULT_URL);
   printf("default agent: %s\n",DEFAULT_AGENT_ID);
   printf("tokens: ~/mcp/token.txt and ~/mcp/agent.token\n");
-  printf("environment: MCP_AGENT_URL, MCP_AGENT_ID, MCP_TOKEN, MCP_AGENT_TOKEN\n");
+  printf("environment: MCP_AGENT_URL, MCP_AGENT_ID, MCP_TOKEN, MCP_AGENT_TOKEN, MCP_CHROME_URL\n");
 }
 
 int main(int argc,char **argv) {
-  int once,rc;
+  struct ChatState *states;
+  CURL *agent_curl,*watch_curl;
+  size_t state_count,state_cap;
+  time_t next_watch,now;
+  pid_t worker_pid,waited;
+  int rc,status;
 
-  once=0;
-  if(argc==2 && strcmp(argv[1],"--once")==0) once=1;
-  else if(argc==2 && (strcmp(argv[1],"-h")==0 || strcmp(argv[1],"--help")==0)) {
+  if(argc==2 && (strcmp(argv[1],"-h")==0 || strcmp(argv[1],"--help")==0)) {
     usage(argv[0]);
     return 0;
-  } else if(argc!=1) {
+  }
+  if(argc!=1) {
     usage(argv[0]);
     return 2;
   }
+  if(read_text_token("MCP_TOKEN","token.txt",g_mcp_token,sizeof(g_mcp_token))!=0) {
+    fprintf(stderr,"cannot read MCP token\n");
+    return 1;
+  }
+  if(read_text_token("MCP_AGENT_TOKEN","agent.token",g_agent_token,sizeof(g_agent_token))!=0) {
+    fprintf(stderr,"cannot read agent token\n");
+    return 1;
+  }
   if(curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) return 1;
-  rc=0;
+  agent_curl=curl_easy_init();
+  watch_curl=curl_easy_init();
+  if(agent_curl==NULL || watch_curl==NULL) {
+    if(agent_curl!=NULL) curl_easy_cleanup(agent_curl);
+    if(watch_curl!=NULL) curl_easy_cleanup(watch_curl);
+    curl_global_cleanup();
+    return 1;
+  }
+  states=NULL;
+  state_count=0;
+  state_cap=0;
+  worker_pid=0;
+  next_watch=time(NULL);
+  log_line(stdout,"START","mcp_agent=%s agent=%s watch=%ds",MCP_AGENT_VERSION,agent_id(),WATCH_INTERVAL);
+  log_line(stdout,"START","Chrome=%s MCP=%s",chrome_host(),agent_url());
   for(;;) {
-    rc=wait_once();
+    now=time(NULL);
+    if(now>=next_watch) {
+      watch_scan(watch_curl,&states,&state_count,&state_cap,1);
+      next_watch=now+WATCH_INTERVAL;
+    }
+    if(worker_pid!=0) {
+      waited=waitpid(worker_pid,&status,WNOHANG);
+      if(waited==0) {
+        sleep(1);
+        continue;
+      }
+      if(waited<0)
+        log_line(stderr,"ERROR","agent worker waitpid failed pid=%ld error=%s",(long)worker_pid,strerror(errno));
+      else if(WIFEXITED(status))
+        log_line(stdout,"AGENT","worker ended pid=%ld exit=%d",(long)worker_pid,WEXITSTATUS(status));
+      else if(WIFSIGNALED(status))
+        log_line(stderr,"ERROR","agent worker ended pid=%ld signal=%d",(long)worker_pid,WTERMSIG(status));
+      worker_pid=0;
+      continue;
+    }
+    rc=agent_wait(agent_curl,&worker_pid);
     if(rc<0) {
+      log_line(stderr,"ERROR","agent retry in 2s");
       sleep(2);
       continue;
     }
-    if(rc>0 && once) {
-      rc=0;
-      break;
-    }
   }
-  curl_global_cleanup();
-  return rc;
 }
